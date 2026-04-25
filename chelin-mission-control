@@ -1,0 +1,1112 @@
+#!/usr/bin/env python3
+"""chelin-mission-control — Mission Control for live Claude Code sessions.
+
+Renders a NetHack-style TUI listing every active Claude Code session on this
+machine: project, branch, status, idle time, model, tokens. Polls the
+~/.claude/projects/ JSONL transcripts plus the live `claude` process list.
+
+Keys:
+  j/k or arrows  move cursor
+  g / G          jump to top / bottom
+  enter          show session detail (last messages)
+  f              focus the iTerm/Terminal tab running this session
+  o              open the cwd in Finder
+  c              copy session id to clipboard
+  K              send SIGTERM to the session's process
+  r              force refresh
+  q / esc        quit
+"""
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+MC_DIR       = Path.home() / ".claude" / "mission-control"
+NO_PROMPT_SENTINEL = MC_DIR / ".no-setup-prompt"
+LIVE_WINDOW_SEC = 30 * 60  # transcripts touched within this window count as "live"
+REFRESH_SEC = 2.0
+
+# events we install hooks for — every signal we need for accurate status detection
+HOOK_EVENTS = (
+    "SessionStart", "SessionEnd",
+    "UserPromptSubmit",
+    "PreToolUse", "PostToolUse",
+    "PermissionRequest",
+    "Notification",
+    "Stop", "StopFailure",
+    "SubagentStart", "SubagentStop",
+)
+# sentinel string embedded in installed hook commands so we can identify our
+# entries during --setup / --teardown regardless of script path or rename
+HOOK_MARKER = "CMC_HOOK=1"
+
+
+class Status(str, Enum):
+    WORKING = "working"
+    WAITING = "waiting"
+    IDLE    = "idle"
+    STUCK   = "stuck"
+    ENDED   = "ended"
+    ZOMBIE  = "zombie"
+
+    @property
+    def glyph(self) -> str:
+        return _STATUS_GLYPH[self]
+
+    @property
+    def sort_rank(self) -> int:
+        return _STATUS_RANK[self]
+
+
+_STATUS_GLYPH = {
+    Status.WORKING: "◆",
+    Status.WAITING: "!",
+    Status.IDLE:    "·",
+    Status.STUCK:   "✗",
+    Status.ENDED:   "†",
+    Status.ZOMBIE:  "Z",
+}
+
+_STATUS_RANK = {
+    Status.WAITING: 0,
+    Status.STUCK:   1,
+    Status.WORKING: 2,
+    Status.IDLE:    3,
+    Status.ZOMBIE:  4,
+    Status.ENDED:   5,
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data model
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Session:
+    session_id: str
+    jsonl_path: Path
+    cwd: str
+    branch: str = "?"
+    status: Status = Status.IDLE
+    status_detail: str = ""
+    last_activity: float = 0.0
+    model: str = "?"
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cache_read: int = 0
+    pid: Optional[int] = None
+    last_user_msg: str = ""
+    last_assistant_msg: str = ""
+    last_tool: str = ""
+    tail_entries: list[dict] = field(default_factory=list)
+
+    @property
+    def project_name(self) -> str:
+        return Path(self.cwd).name or self.cwd
+
+    @property
+    def idle_sec(self) -> float:
+        return time.time() - self.last_activity
+
+    @property
+    def tokens_total(self) -> int:
+        return self.tokens_in + self.tokens_out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hook callback + state file
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# When `chelin-mission-control --setup` runs, it installs hook commands in
+# `~/.claude/settings.json` that re-invoke this script as `<path> --hook`.
+# Claude Code fires those hooks during sessions and pipes a JSON payload on
+# stdin. The hook handler appends a compact event record to a per-session
+# state file at `~/.claude/mission-control/<session_id>.state.jsonl`.
+# `summarize_session` reads that state file as the authoritative source of
+# truth for status — no JSONL transcript heuristics involved.
+
+def cmd_hook() -> int:
+    """Hook callback mode — read JSON payload from stdin, append to state file."""
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0  # never block Claude on parse failure
+    sid = payload.get("session_id")
+    if not sid:
+        return 0
+    rec = {
+        "ts": time.time(),
+        "event": payload.get("hook_event_name") or "?",
+    }
+    # carry only the fields we use for status / display
+    for k in ("tool_name", "tool_use_id", "matcher", "permission_mode", "reason"):
+        v = payload.get(k)
+        if v is not None:
+            rec[k] = v
+    try:
+        MC_DIR.mkdir(parents=True, exist_ok=True)
+        with (MC_DIR / f"{sid}.state.jsonl").open("a") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception:
+        pass  # never block Claude
+    return 0
+
+
+def gc_state_files(max_age_sec: float = 24 * 3600) -> None:
+    """Delete state files untouched for longer than `max_age_sec`."""
+    if not MC_DIR.exists():
+        return
+    cutoff = time.time() - max_age_sec
+    for p in MC_DIR.glob("*.state.jsonl"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            pass
+
+
+def read_state_events(session_id: str) -> list[dict]:
+    """Return the list of hook events recorded for this session, in order."""
+    p = MC_DIR / f"{session_id}.state.jsonl"
+    if not p.exists():
+        return []
+    try:
+        return [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
+def status_from_events(events: list[dict]) -> tuple[Optional[Status], str, str]:
+    """Derive (status, detail, last_tool) from a session's hook event log.
+
+    Returns (None, "", "") if the events don't tell us anything actionable
+    (caller should then fall back to JSONL heuristics).
+    """
+    if not events:
+        return None, "", ""
+    pending_tools: dict[str, str] = {}  # tool_use_id → tool_name
+    pending_permission_tool: Optional[str] = None
+    last_tool = ""
+    for e in events:
+        ev = e.get("event")
+        tu = e.get("tool_use_id")
+        name = e.get("tool_name")
+        if name:
+            last_tool = name
+        if ev == "PreToolUse" and tu:
+            pending_tools[tu] = name or "?"
+        elif ev in ("PostToolUse", "PostToolUseFailure") and tu:
+            pending_tools.pop(tu, None)
+            # answering a permission prompt clears it
+            pending_permission_tool = None
+        elif ev == "PermissionRequest":
+            pending_permission_tool = name or last_tool or "?"
+        elif ev == "Notification" and e.get("matcher") == "permission_prompt":
+            pending_permission_tool = name or last_tool or "?"
+        elif ev == "Stop":
+            pending_permission_tool = None
+        elif ev == "SessionEnd":
+            return Status.ENDED, "", last_tool
+
+    last = events[-1]
+    last_ev = last.get("event")
+    if pending_permission_tool:
+        return Status.STUCK, f"awaiting permission ({pending_permission_tool})", last_tool
+    if pending_tools:
+        running = next(iter(pending_tools.values()))
+        return Status.WORKING, f"tool: {running}", last_tool
+    if last_ev == "Stop":
+        return Status.WAITING, "needs input", last_tool
+    if last_ev == "StopFailure":
+        reason = last.get("matcher") or last.get("reason") or "?"
+        return Status.STUCK, str(reason), last_tool
+    if last_ev == "UserPromptSubmit":
+        return Status.WORKING, "thinking", last_tool
+    if last_ev in ("PostToolUse", "PostToolUseFailure", "SubagentStart", "SubagentStop"):
+        # tool just finished; next PreToolUse or Stop is on the way
+        return Status.WORKING, "thinking", last_tool
+    if last_ev == "SessionStart":
+        return Status.IDLE, "", last_tool
+    return None, "", last_tool
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Setup / teardown — manage hook entries in ~/.claude/settings.json
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _read_settings() -> dict:
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except Exception as e:
+        print(f"error reading {SETTINGS_PATH}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _write_settings(data: dict) -> None:
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _hook_command() -> str:
+    # the leading `CMC_HOOK=1` is both a harmless env var and our sentinel
+    # for matching this entry on later --setup / --teardown runs
+    return f"{HOOK_MARKER} {Path(__file__).resolve()} --hook"
+
+
+def _is_our_group(group: dict) -> bool:
+    """True if a hook group contains a command referencing this tool."""
+    for h in group.get("hooks", []) or []:
+        if isinstance(h, dict) and HOOK_MARKER in str(h.get("command", "")):
+            return True
+    return False
+
+
+def cmd_setup() -> int:
+    settings = _read_settings()
+    hooks = settings.setdefault("hooks", {})
+    new_group = {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": _hook_command()}],
+    }
+    added, already = [], []
+    for event in HOOK_EVENTS:
+        groups = hooks.setdefault(event, [])
+        if any(_is_our_group(g) for g in groups):
+            already.append(event)
+            continue
+        groups.append(new_group)
+        added.append(event)
+    _write_settings(settings)
+    MC_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        MC_DIR.chmod(0o700)
+    except OSError:
+        pass
+    print(f"settings: {SETTINGS_PATH}")
+    print(f"state dir: {MC_DIR}")
+    print(f"installed: {', '.join(added) if added else '(none — all already present)'}")
+    if already:
+        print(f"already present: {', '.join(already)}")
+    return 0
+
+
+def cmd_teardown() -> int:
+    settings = _read_settings()
+    hooks = settings.get("hooks", {})
+    removed = []
+    for event in list(hooks.keys()):
+        before = len(hooks[event])
+        hooks[event] = [g for g in hooks[event] if not _is_our_group(g)]
+        if len(hooks[event]) != before:
+            removed.append(event)
+        if not hooks[event]:
+            del hooks[event]
+    if not hooks:
+        settings.pop("hooks", None)
+    _write_settings(settings)
+    print(f"removed from: {', '.join(removed) if removed else '(no entries found)'}")
+    return 0
+
+
+def hooks_installed() -> bool:
+    """True if any of our hook entries are present in ~/.claude/settings.json."""
+    if not SETTINGS_PATH.exists():
+        return False
+    try:
+        settings = json.loads(SETTINGS_PATH.read_text())
+    except Exception:
+        return False
+    hooks = settings.get("hooks", {})
+    for event in HOOK_EVENTS:
+        for group in hooks.get(event, []) or []:
+            if _is_our_group(group):
+                return True
+    return False
+
+
+def maybe_prompt_first_run() -> None:
+    """If hooks aren't installed and the user hasn't opted out, ask once.
+
+    Defaults to installing on Enter. Writes a sentinel file when the user
+    picks "don't ask again" so we never prompt on this machine again.
+    Skipped in non-interactive contexts (piped stdin, etc).
+    """
+    if hooks_installed() or NO_PROMPT_SENTINEL.exists():
+        return
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return
+    print("chelin-mission-control can install hooks in ~/.claude/settings.json")
+    print("for accurate status detection (especially permission prompts).")
+    print("without them, the TUI falls back to JSONL transcript heuristics.")
+    print()
+    print("  [Y] install now (recommended)")
+    print("  [n] skip — use heuristic mode for this run")
+    print("  [d] skip and don't ask again")
+    print()
+    try:
+        choice = input("> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        sys.exit(0)
+    if choice in ("", "y", "yes"):
+        cmd_setup()
+        print()
+        try:
+            input("press enter to launch mission control...")
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(0)
+    elif choice in ("d", "dont", "don't"):
+        try:
+            MC_DIR.mkdir(parents=True, exist_ok=True)
+            NO_PROMPT_SENTINEL.touch()
+        except OSError:
+            pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Discovery
+# ──────────────────────────────────────────────────────────────────────────────
+
+def decode_project_dir(name: str) -> str:
+    """Best-effort decode of the encoded cwd in the projects dir name.
+
+    Claude Code encodes the cwd by replacing `/` with `-`, so the original
+    path can't be perfectly recovered (real `-` chars are ambiguous). We try
+    the path-as-is, then probe the filesystem for the longest matching dir.
+    """
+    if not name.startswith("-"):
+        return name
+    parts = name[1:].split("-")
+    # Greedy: try to assemble the longest existing path by joining segments.
+    candidate = Path("/")
+    i = 0
+    while i < len(parts):
+        # try the longest remaining join first
+        for j in range(len(parts), i, -1):
+            chunk = "-".join(parts[i:j])
+            trial = candidate / chunk
+            if trial.exists():
+                candidate = trial
+                i = j
+                break
+        else:
+            # nothing matched → just append remaining as dashed
+            candidate = candidate / "-".join(parts[i:])
+            break
+    return str(candidate)
+
+
+def live_claude_pids() -> dict[str, int]:
+    """Return mapping of cwd → pid for currently-running `claude` processes."""
+    out = {}
+    try:
+        ps = subprocess.run(
+            ["ps", "-axo", "pid,command"], capture_output=True, text=True, timeout=2
+        ).stdout
+    except Exception:
+        return out
+    for line in ps.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        # match the command's basename — avoids false positives from any
+        # process whose argv happens to mention "claude" (e.g. this script,
+        # editors, grep, osascript invocations).
+        argv0 = parts[1].split(None, 1)[0]
+        if Path(argv0).name != "claude":
+            continue
+        # walk the cwd via lsof if we can
+        try:
+            cwd = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=1
+            ).stdout
+            for ln in cwd.splitlines():
+                if ln.startswith("n"):
+                    out[ln[1:]] = pid
+        except Exception:
+            pass
+    return out
+
+
+def git_branch(cwd: str) -> str:
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "branch", "--show-current"],
+            capture_output=True, text=True, timeout=1
+        )
+        if r.returncode == 0:
+            b = r.stdout.strip()
+            return b or "(detached)"
+    except Exception:
+        pass
+    return "—"
+
+
+def parse_jsonl_tail(path: Path, n: int = 60) -> list[dict]:
+    """Read the last N JSONL entries (best-effort, simple full read)."""
+    try:
+        size = path.stat().st_size
+        # only read last ~256KB for big files
+        with path.open("rb") as f:
+            if size > 256 * 1024:
+                f.seek(-256 * 1024, os.SEEK_END)
+                f.readline()  # discard partial
+            data = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    entries = []
+    for ln in data.splitlines()[-n:]:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            entries.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return entries
+
+
+def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, int],
+                      force_live: bool = False) -> Optional[Session]:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    if not force_live and time.time() - st.st_mtime > LIVE_WINDOW_SEC:
+        return None
+    entries = parse_jsonl_tail(path)
+    if not entries:
+        return None
+
+    cwd = ""
+    model = "?"
+    tokens_in = tokens_out = cache_read = 0
+    last_user = last_asst = last_tool = ""
+    pending_tool_uses: dict[str, str] = {}  # id → name
+
+    for e in entries:
+        if "cwd" in e and not cwd:
+            cwd = e.get("cwd") or ""
+        msg = e.get("message") or {}
+        if isinstance(msg, dict):
+            usage = msg.get("usage") or {}
+            tokens_in += usage.get("input_tokens", 0) or 0
+            tokens_out += usage.get("output_tokens", 0) or 0
+            cache_read += usage.get("cache_read_input_tokens", 0) or 0
+            if msg.get("model"):
+                model = msg["model"]
+        # extract content
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            if e.get("type") == "user":
+                last_user = content[:200]
+            elif e.get("type") == "assistant":
+                last_asst = content[:200]
+        elif isinstance(content, list):
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "text" and c.get("text"):
+                    if e.get("type") == "assistant":
+                        last_asst = c["text"][:200]
+                    elif e.get("type") == "user":
+                        last_user = c["text"][:200]
+                elif c.get("type") == "tool_use":
+                    pending_tool_uses[c.get("id", "")] = c.get("name", "?")
+                    last_tool = c.get("name", "?")
+                elif c.get("type") == "tool_result":
+                    pending_tool_uses.pop(c.get("tool_use_id", ""), None)
+
+    if not cwd:
+        cwd = decode_project_dir(project_dir_name)
+
+    # status: prefer the per-session hook event log (authoritative) and fall
+    # back to JSONL-tail heuristics when there's no state file (sessions that
+    # started before `--setup` or before chelin-mission-control was installed)
+    age = time.time() - st.st_mtime
+    pid = live_pids.get(cwd)
+
+    state_status, state_detail, state_tool = status_from_events(read_state_events(path.stem))
+    if state_tool:
+        last_tool = state_tool
+
+    if state_status is not None and (force_live or pid is not None):
+        status, detail = state_status, state_detail
+    elif not (force_live or pid is not None):
+        status, detail = Status.ENDED, ""
+    elif state_status is not None:  # state file says ENDED even without live pid
+        status, detail = state_status, state_detail
+    else:
+        # fallback: legacy JSONL heuristic
+        last_type = entries[-1].get("type")
+        if pending_tool_uses:
+            if age > 15:
+                status, detail = Status.STUCK, f"awaiting permission ({last_tool})"
+            else:
+                status, detail = Status.WORKING, f"tool: {last_tool}"
+        elif age > 5 and last_type == "assistant":
+            status, detail = Status.WAITING, "needs input"
+        elif age > 5:
+            status, detail = Status.WAITING, f"idle {fmt_idle(age)}"
+        else:
+            status, detail = Status.WORKING, "thinking"
+
+    return Session(
+        session_id=path.stem,
+        jsonl_path=path,
+        cwd=cwd,
+        branch=git_branch(cwd),
+        status=status,
+        status_detail=detail,
+        last_activity=st.st_mtime,
+        model=model,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cache_read=cache_read,
+        pid=pid,
+        last_user_msg=last_user,
+        last_assistant_msg=last_asst,
+        last_tool=last_tool,
+        tail_entries=entries[-20:],
+    )
+
+
+def encode_cwd(cwd: str) -> str:
+    """Inverse of decode_project_dir — replace `/` with `-`."""
+    return cwd.replace("/", "-")
+
+
+def newest_jsonl(proj_dir: Path) -> Optional[Path]:
+    candidates = list(proj_dir.glob("*.jsonl"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def discover_sessions() -> list[Session]:
+    if not PROJECTS_DIR.exists():
+        return []
+    pids = live_claude_pids()  # cwd -> pid
+
+    sessions: list[Session] = []
+    seen_jsonl: set[Path] = set()
+
+    # 1) live processes are the source of truth — always include them, no mtime gate
+    for cwd, pid in pids.items():
+        proj_dir = PROJECTS_DIR / encode_cwd(cwd)
+        jl = newest_jsonl(proj_dir) if proj_dir.exists() else None
+        if jl:
+            s = summarize_session(jl, proj_dir.name, pids, force_live=True)
+            if s:
+                s.pid = pid
+                # zombie heuristic: no transcript activity in the last hour
+                if s.idle_sec > 3600:
+                    s.status = Status.ZOMBIE
+                    s.status_detail = f"no writes for {fmt_idle(s.idle_sec)}"
+                sessions.append(s)
+                seen_jsonl.add(jl)
+                continue
+        # no transcript at all — bare process row, use process start time as "last activity"
+        try:
+            etime = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=1).stdout.strip()
+            started = time.mktime(time.strptime(etime, "%a %b %d %H:%M:%S %Y"))
+        except Exception:
+            started = time.time()
+        sessions.append(Session(
+            session_id="(no transcript)",
+            jsonl_path=Path("/dev/null"),
+            cwd=cwd,
+            branch=git_branch(cwd),
+            status=Status.ZOMBIE,
+            status_detail="no transcript file",
+            last_activity=started,
+            pid=pid,
+        ))
+
+    # 2) recent transcripts whose process has exited — surface as "ended" so user knows
+    for proj in PROJECTS_DIR.iterdir():
+        if not proj.is_dir():
+            continue
+        for jl in proj.glob("*.jsonl"):
+            if jl in seen_jsonl:
+                continue
+            s = summarize_session(jl, proj.name, pids)
+            if s:
+                sessions.append(s)
+
+    sessions.sort(key=lambda s: (s.status.sort_rank, -s.last_activity))
+    return sessions
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rendering
+# ──────────────────────────────────────────────────────────────────────────────
+
+# nethack-ish color pairs
+C_BORDER = 1
+C_HEADER = 2
+C_WORKING = 3
+C_WAITING = 4
+C_IDLE = 5
+C_STUCK = 6
+C_CURSOR = 7
+C_DIM = 8
+C_TITLE = 9
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_BORDER,  curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_HEADER,  curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_WORKING, curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_WAITING, curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_IDLE,    curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_STUCK,   curses.COLOR_RED,     -1)
+    curses.init_pair(C_CURSOR,  curses.COLOR_BLACK,   curses.COLOR_GREEN)
+    # bright-black (8) only exists on 256-color terminals; fall back to default
+    dim_fg = 8 if curses.COLORS >= 16 else -1
+    curses.init_pair(C_DIM,     dim_fg,               -1)
+    curses.init_pair(C_TITLE,   curses.COLOR_MAGENTA, -1)
+
+
+def fmt_idle(sec: float) -> str:
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec:>3}s"
+    if sec < 3600:
+        return f"{sec//60:>2}m{sec%60:02d}s"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    return f"{h:>2}h{m:02d}m"
+
+
+def fmt_tokens(n: int) -> str:
+    if n < 1000: return f"{n}"
+    if n < 1_000_000: return f"{n/1000:.1f}k"
+    return f"{n/1_000_000:.2f}M"
+
+
+def status_color(status: Status) -> int:
+    return {
+        Status.WORKING: curses.color_pair(C_WORKING) | curses.A_BOLD,
+        Status.WAITING: curses.color_pair(C_WAITING) | curses.A_BOLD | curses.A_BLINK,
+        Status.STUCK:   curses.color_pair(C_STUCK)   | curses.A_BOLD,
+        Status.IDLE:    curses.color_pair(C_IDLE)    | curses.A_DIM,
+        Status.ENDED:   curses.color_pair(C_DIM)     | curses.A_DIM,
+        Status.ZOMBIE:  curses.color_pair(C_STUCK)   | curses.A_DIM,
+    }.get(status, 0)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    text = text[: max(0, w - x - 1)]
+    try:
+        win.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
+def draw_box(win, y, x, h, w, title=""):
+    border = curses.color_pair(C_BORDER)
+    safe_addstr(win, y, x, "+" + "-" * (w - 2) + "+", border)
+    safe_addstr(win, y + h - 1, x, "+" + "-" * (w - 2) + "+", border)
+    for i in range(1, h - 1):
+        safe_addstr(win, y + i, x, "|", border)
+        safe_addstr(win, y + i, x + w - 1, "|", border)
+    if title:
+        safe_addstr(win, y, x + 2, f"[ {title} ]", curses.color_pair(C_TITLE) | curses.A_BOLD)
+
+
+TABLE_COLS = [
+    ("##",      3),
+    ("st",      3),
+    ("project", 22),
+    ("branch",  18),
+    ("status",  24),
+    ("idle",    7),
+    ("tokens",  9),
+    ("model",   18),
+    ("pid",     6),
+]
+
+
+def render_header(stdscr, sessions: list[Session], last_refresh: float):
+    _, w = stdscr.getmaxyx()
+    title = "*** CLAUDE MISSION CONTROL ***"
+    safe_addstr(stdscr, 0, max(0, (w - len(title)) // 2), title,
+                curses.color_pair(C_TITLE) | curses.A_BOLD)
+    age = time.time() - last_refresh
+    sub = f"sessions: {len(sessions)}    refresh: {age:.1f}s ago    {time.strftime('%H:%M:%S')}"
+    safe_addstr(stdscr, 1, max(0, (w - len(sub)) // 2), sub, curses.color_pair(C_DIM))
+
+
+def render_table(stdscr, sessions: list[Session], cursor: int, top: int, table_h: int):
+    _, w = stdscr.getmaxyx()
+    draw_box(stdscr, top, 0, table_h, w, "live sessions")
+
+    x = 2
+    for name, width in TABLE_COLS:
+        safe_addstr(stdscr, top + 1, x, name.ljust(width),
+                    curses.color_pair(C_HEADER) | curses.A_BOLD | curses.A_UNDERLINE)
+        x += width + 1
+
+    visible = table_h - 3
+    start = max(0, cursor - visible + 1) if cursor >= visible else 0
+    for i, s in enumerate(sessions[start:start + visible]):
+        idx = start + i
+        row_y = top + 2 + i
+        is_cursor = idx == cursor
+        if is_cursor:
+            safe_addstr(stdscr, row_y, 1, " " * (w - 2),
+                        curses.color_pair(C_CURSOR))
+        cells = [
+            (chr(ord('a') + idx) if idx < 26 else str(idx), 0),
+            (s.status.glyph, status_color(s.status)),
+            (s.project_name[:21], 0),
+            (s.branch[:17], curses.color_pair(C_DIM) if s.branch in ("—", "?") else 0),
+            ((s.status.value.upper() + " " + s.status_detail)[:23], status_color(s.status)),
+            (fmt_idle(s.idle_sec), 0),
+            (fmt_tokens(s.tokens_total), 0),
+            (s.model.replace("claude-", "")[:17], curses.color_pair(C_DIM)),
+            (str(s.pid) if s.pid else "—", curses.color_pair(C_DIM)),
+        ]
+        x = 2
+        for (txt, attr), (_, width) in zip(cells, TABLE_COLS):
+            if is_cursor:
+                # strip the cell's color pair so we don't OR pair numbers
+                # into an uninitialized pair (e.g. C_DIM | C_CURSOR → pair 15)
+                a = (attr & ~curses.A_COLOR) | curses.color_pair(C_CURSOR)
+            else:
+                a = attr
+            safe_addstr(stdscr, row_y, x, txt.ljust(width), a)
+            x += width + 1
+
+    if not sessions:
+        safe_addstr(stdscr, top + 3, 4,
+                    "no live claude sessions found in the last 30 minutes",
+                    curses.color_pair(C_DIM))
+
+
+def render_detail(stdscr, sessions: list[Session], cursor: int, detail_y: int, detail_h: int):
+    if detail_h <= 4 or not sessions:
+        return
+    _, w = stdscr.getmaxyx()
+    s = sessions[cursor] if cursor < len(sessions) else sessions[0]
+    draw_box(stdscr, detail_y, 0, detail_h, w,
+             f"detail :: {s.session_id[:8]}")
+    info_lines = [
+        ("cwd",        s.cwd),
+        ("session",    s.session_id),
+        ("last user",  s.last_user_msg.replace("\n", " ⏎ ")),
+        ("last asst",  s.last_assistant_msg.replace("\n", " ⏎ ")),
+        ("last tool",  s.last_tool or "—"),
+        ("cache read", fmt_tokens(s.cache_read)),
+    ]
+    for i, (k, v) in enumerate(info_lines):
+        if i >= detail_h - 2:
+            break
+        safe_addstr(stdscr, detail_y + 1 + i, 2,
+                    f"{k:>10} :", curses.color_pair(C_HEADER))
+        safe_addstr(stdscr, detail_y + 1 + i, 14, str(v))
+
+
+def render_keybar(stdscr, message: str):
+    h, w = stdscr.getmaxyx()
+    keys = " [j/k]move [f]ocus [enter]detail [o]pen [c]opy [K]ill [r]efresh [q]uit "
+    safe_addstr(stdscr, h - 1, 0, keys.ljust(w - 1)[: w - 1],
+                curses.color_pair(C_BORDER) | curses.A_REVERSE)
+    if message:
+        safe_addstr(stdscr, h - 1, w - len(message) - 2, message,
+                    curses.color_pair(C_HEADER) | curses.A_BOLD)
+
+
+def render(stdscr, sessions: list[Session], cursor: int, last_refresh: float, message: str):
+    stdscr.erase()
+    h, _ = stdscr.getmaxyx()
+    top = 3
+    table_h = max(8, h - top - 8)
+    render_header(stdscr, sessions, last_refresh)
+    render_table(stdscr, sessions, cursor, top, table_h)
+    render_detail(stdscr, sessions, cursor, top + table_h, h - (top + table_h) - 2)
+    render_keybar(stdscr, message)
+    stdscr.refresh()
+
+
+def show_detail_modal(stdscr, s: Session):
+    h, w = stdscr.getmaxyx()
+    win = curses.newwin(h - 4, w - 6, 2, 3)
+    win.keypad(True)
+    win.erase()
+    draw_box(win, 0, 0, h - 4, w - 6, f"transcript tail :: {s.project_name}")
+    y = 1
+    for e in s.tail_entries:
+        if y >= h - 6:
+            break
+        t = e.get("type", "?")
+        msg = e.get("message") or {}
+        content = msg.get("content") if isinstance(msg, dict) else None
+        prefix = {"user": "U>", "assistant": "A>", "system": "S>"}.get(t, "??")
+        attr = {"user": curses.color_pair(C_WAITING),
+                "assistant": curses.color_pair(C_WORKING),
+                "system": curses.color_pair(C_DIM)}.get(t, 0)
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            chunks = []
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "text":
+                    chunks.append(c.get("text", ""))
+                elif c.get("type") == "tool_use":
+                    chunks.append(f"<tool_use {c.get('name')}>")
+                elif c.get("type") == "tool_result":
+                    chunks.append("<tool_result>")
+            text = " | ".join(chunks)
+        text = text.replace("\n", " ⏎ ")[: w - 14]
+        safe_addstr(win, y, 2, prefix, attr | curses.A_BOLD)
+        safe_addstr(win, y, 5, text)
+        y += 1
+    safe_addstr(win, h - 6, 2, "press any key to return",
+                curses.color_pair(C_DIM))
+    win.refresh()
+    win.getch()
+
+
+def copy_to_clipboard(text: str) -> bool:
+    try:
+        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        p.communicate(text.encode())
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def open_in_finder(path: str):
+    try:
+        subprocess.Popen(["open", path])
+    except Exception:
+        pass
+
+
+def tty_for_pid(pid: int) -> Optional[str]:
+    try:
+        r = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=1)
+        t = r.stdout.strip()
+        if t and t != "?":
+            return f"/dev/{t}" if not t.startswith("/dev/") else t
+    except Exception:
+        pass
+    return None
+
+
+_ITERM_SCRIPT = '''
+on run argv
+  set ttyPath to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is ttyPath then
+            select s
+            tell t to select
+            tell w to select
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+    return "not found"
+  end tell
+end run
+'''
+
+_TERMINAL_SCRIPT = '''
+on run argv
+  set ttyPath to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is ttyPath then
+          set selected of t to true
+          set index of w to 1
+          activate
+          return "ok"
+        end if
+      end repeat
+    end repeat
+    return "not found"
+  end tell
+end run
+'''
+
+
+def _run_osascript(script: str, arg: str) -> tuple[bool, str]:
+    try:
+        r = subprocess.run(
+            ["osascript", "-", arg],
+            input=script, capture_output=True, text=True, timeout=3,
+        )
+        if "ok" in r.stdout:
+            return True, ""
+        return False, (r.stderr or "").strip()
+    except Exception as e:
+        return False, str(e)
+
+
+def focus_terminal_for_tty(tty_path: str) -> tuple[bool, str]:
+    """Activate the iTerm2 (or Terminal.app) window+tab whose TTY matches.
+
+    Returns (ok, message).
+    """
+    ok, _ = _run_osascript(_ITERM_SCRIPT, tty_path)
+    if ok:
+        return True, "focused iTerm2"
+    ok, err = _run_osascript(_TERMINAL_SCRIPT, tty_path)
+    if ok:
+        return True, "focused Terminal"
+    return False, err or "tab not found"
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    init_colors()
+    stdscr.nodelay(True)
+    stdscr.timeout(200)
+    gc_state_files()
+
+    sessions: list[Session] = []
+    cursor = 0
+    last_refresh = 0.0
+    message = ""
+    message_until = 0.0
+
+    def refresh():
+        nonlocal sessions, last_refresh, cursor
+        sessions = discover_sessions()
+        last_refresh = time.time()
+        if cursor >= len(sessions):
+            cursor = max(0, len(sessions) - 1)
+
+    refresh()
+
+    while True:
+        if time.time() - last_refresh >= REFRESH_SEC:
+            refresh()
+        if message and time.time() > message_until:
+            message = ""
+        render(stdscr, sessions, cursor, last_refresh, message)
+
+        try:
+            ch = stdscr.getch()
+        except KeyboardInterrupt:
+            break
+        if ch == -1:
+            continue
+        if ch in (ord("q"), 27):
+            break
+        elif ch in (ord("j"), curses.KEY_DOWN):
+            if sessions:
+                cursor = (cursor + 1) % len(sessions)
+        elif ch in (ord("k"), curses.KEY_UP):
+            if sessions:
+                cursor = (cursor - 1) % len(sessions)
+        elif ch == ord("g"):
+            cursor = 0
+        elif ch == ord("G"):
+            cursor = max(0, len(sessions) - 1)
+        elif ch == ord("r"):
+            refresh()
+            message = "refreshed"
+            message_until = time.time() + 1.5
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            if sessions:
+                show_detail_modal(stdscr, sessions[cursor])
+        elif ch == ord("o"):
+            if sessions:
+                open_in_finder(sessions[cursor].cwd)
+                message = "opened"
+                message_until = time.time() + 1.5
+        elif ch == ord("c"):
+            if sessions:
+                ok = copy_to_clipboard(sessions[cursor].session_id)
+                message = "copied" if ok else "copy failed"
+                message_until = time.time() + 1.5
+        elif ch == ord("K"):
+            if sessions and sessions[cursor].pid:
+                try:
+                    os.kill(sessions[cursor].pid, 15)  # SIGTERM
+                    message = f"sent SIGTERM to {sessions[cursor].pid}"
+                except Exception as e:
+                    message = f"kill failed: {e}"
+                message_until = time.time() + 2.0
+        elif ch == ord("f"):
+            if sessions:
+                s = sessions[cursor]
+                if not s.pid:
+                    message = "no live pid"
+                else:
+                    tty = tty_for_pid(s.pid)
+                    if not tty:
+                        message = "no tty for pid"
+                    else:
+                        ok, msg = focus_terminal_for_tty(tty)
+                        message = msg
+                message_until = time.time() + 2.0
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="chelin-mission-control",
+        description="Mission Control for live Claude Code sessions.",
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--setup", action="store_true",
+                   help="install hook entries in ~/.claude/settings.json so the TUI "
+                        "can detect session state authoritatively")
+    g.add_argument("--teardown", action="store_true",
+                   help="remove the hook entries previously installed by --setup")
+    g.add_argument("--hook", action="store_true",
+                   help="(internal) hook callback — reads JSON payload from stdin "
+                        "and appends to ~/.claude/mission-control/<session>.state.jsonl")
+    return p
+
+
+if __name__ == "__main__":
+    args = _build_arg_parser().parse_args()
+    if args.hook:
+        sys.exit(cmd_hook())
+    if args.setup:
+        sys.exit(cmd_setup())
+    if args.teardown:
+        sys.exit(cmd_teardown())
+    maybe_prompt_first_run()
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
