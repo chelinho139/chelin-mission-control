@@ -809,6 +809,209 @@ def render_table(stdscr, sessions: list[Session], cursor: int, top: int, table_h
                     curses.color_pair(C_DIM))
 
 
+# grid layout: cards laid out left-to-right, top-to-bottom inside the box
+CARD_W   = 32
+CARD_H   = 9
+CARD_GAP = 1
+
+
+def grid_cols(screen_w: int) -> int:
+    """How many cards fit across the screen at this width."""
+    avail = max(0, screen_w - 4)  # 1-col margin inside each box border
+    return max(1, (avail + CARD_GAP) // (CARD_W + CARD_GAP))
+
+
+# mascot animations — each frame is a tuple of 4 strings, each MASCOT_W chars wide.
+# row 0 is the "above-head" floating area (used by sleeping; empty otherwise).
+MASCOT_W = 13
+
+MASCOTS = {
+    "sleeping": [
+        ("        z    ",
+         "▄█████▄ Z    ",
+         "█─░░░─█      ",
+         "▀█████▀      "),
+        ("        Z    ",
+         "▄█████▄ z    ",
+         "█─░░░─█      ",
+         "▀█████▀      "),
+    ],
+    "working": [
+        # 8-frame braille spinner with the eyes blinking once per cycle.
+        # the spinner is the unambiguous "I'm working" signal; the blink
+        # adds life so the mascot doesn't read as frozen.
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠋   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠙   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠹   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█-░░░-█  ⠸   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠼   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠴   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠦   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█-░░░-█  ⠧   ",
+         "▀█████▀      "),
+    ],
+    "notifying": [
+        ("             ",
+         "▄█████▄  !   ",
+         "█◉░░░◉█      ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█      ",
+         "▀█████▀      "),
+    ],
+    "waiting": [
+        ("             ",
+         "▄█████▄      ",
+         "█·░░░·█  .   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█·░░░·█ . .  ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█·░░░·█. . . ",
+         "▀█████▀      "),
+    ],
+}
+
+# (animation key, frames-per-second). different speeds give each state its own "feel".
+_MASCOT_FOR_STATUS = {
+    Status.WORKING: ("working",   5.0),
+    Status.WAITING: ("notifying", 2.0),
+    Status.STUCK:   ("notifying", 3.0),
+    Status.IDLE:    ("waiting",   1.5),
+    Status.ZOMBIE:  ("sleeping",  1.0),
+    Status.ENDED:   ("sleeping",  0.5),
+}
+
+
+def _mascot_frame(status: Status) -> tuple[str, ...]:
+    key, speed = _MASCOT_FOR_STATUS.get(status, ("sleeping", 0.5))
+    frames = MASCOTS[key]
+    return frames[int(time.time() * speed) % len(frames)]
+
+
+def _draw_card(stdscr, s: Session, y: int, x: int, is_cursor: bool):
+    inner_w = CARD_W - 2
+    # cursor highlight wins over status color; otherwise the border itself
+    # carries the status color so e.g. a red STUCK card jumps out across the
+    # grid. blink on a border is visual chaos — strip it.
+    if is_cursor:
+        border_attr = curses.color_pair(C_CURSOR) | curses.A_BOLD
+    else:
+        border_attr = status_color(s.status) & ~curses.A_BLINK
+
+    safe_addstr(stdscr, y, x, "+" + "-" * (CARD_W - 2) + "+", border_attr)
+    safe_addstr(stdscr, y + CARD_H - 1, x, "+" + "-" * (CARD_W - 2) + "+", border_attr)
+    for i in range(1, CARD_H - 1):
+        safe_addstr(stdscr, y + i, x, "|", border_attr)
+        safe_addstr(stdscr, y + i, x + CARD_W - 1, "|", border_attr)
+
+    # title overlaid on top border: "[ ◆ project_name ]"
+    title_room = inner_w - 4  # for "[ " and " ]"
+    title_inner = f" {s.status.glyph} {s.project_name} "[:title_room]
+    title_attr = (curses.color_pair(C_CURSOR) | curses.A_BOLD) if is_cursor \
+                 else (curses.color_pair(C_TITLE) | curses.A_BOLD)
+    safe_addstr(stdscr, y, x + 2, f"[{title_inner}]", title_attr)
+
+    # content layout (CARD_H=9 → 7 content lines):
+    #   row 1  mascot row 0 (floating Z for sleeping, else empty)
+    #   row 2  mascot row 1 (head top)         | status verb   ← right of mascot
+    #   row 3  mascot row 2 (eyes/scanner)     | status detail
+    #   row 4  mascot row 3 (head bottom)
+    #   row 5  branch (left) + idle (right)    ← full width below mascot
+    #   row 6  tokens · model (dim)
+    #   row 7  pid (dim)
+    frame = _mascot_frame(s.status)
+    # mascot tinted with status color, but no bold/blink — keep it ambient
+    mascot_attr = status_color(s.status) & ~curses.A_BLINK & ~curses.A_BOLD
+    for i, line in enumerate(frame):
+        safe_addstr(stdscr, y + 1 + i, x + 1, line, mascot_attr)
+
+    status_x = x + 1 + MASCOT_W + 1  # 1 col gap between mascot and status text
+    status_w = max(1, inner_w - MASCOT_W - 1)
+    verb = s.status.value.upper()[:status_w]
+    detail = s.status_detail[:status_w]
+    safe_addstr(stdscr, y + 2, status_x, verb.ljust(status_w),
+                status_color(s.status))
+    safe_addstr(stdscr, y + 3, status_x, detail.ljust(status_w),
+                curses.color_pair(C_DIM))
+
+    idle_str = f"idle {fmt_idle(s.idle_sec)}"
+    branch_room = max(0, inner_w - len(idle_str) - 1)
+    branch_part = (s.branch[:branch_room]).ljust(inner_w - len(idle_str))
+    line_branch = (branch_part + idle_str)[:inner_w]
+    model_short = s.model.replace("claude-", "")
+    line_meta = f"{fmt_tokens(s.tokens_total)} tok · {model_short}"[:inner_w]
+    line_pid = (f"pid {s.pid}" if s.pid else "pid —")[:inner_w]
+    branch_dim = curses.color_pair(C_DIM) if s.branch in ("—", "?") else 0
+
+    safe_addstr(stdscr, y + 5, x + 1, line_branch.ljust(inner_w), branch_dim)
+    safe_addstr(stdscr, y + 6, x + 1, line_meta.ljust(inner_w),
+                curses.color_pair(C_DIM))
+    safe_addstr(stdscr, y + 7, x + 1, line_pid.ljust(inner_w),
+                curses.color_pair(C_DIM))
+
+
+def render_grid(stdscr, sessions: list[Session], cursor: int, top: int, grid_h: int):
+    h, w = stdscr.getmaxyx()
+    draw_box(stdscr, top, 0, grid_h, w, "live sessions")
+
+    if not sessions:
+        safe_addstr(stdscr, top + 2, 4,
+                    "no live claude sessions found in the last 30 minutes",
+                    curses.color_pair(C_DIM))
+        return
+
+    avail_h = grid_h - 2
+    cols = grid_cols(w)
+    rows = max(1, (avail_h + CARD_GAP) // (CARD_H + CARD_GAP))
+    page_size = cols * rows
+    page_start = (cursor // page_size) * page_size
+
+    for i, s in enumerate(sessions[page_start:page_start + page_size]):
+        idx = page_start + i
+        c, r = i % cols, i // cols
+        cy = top + 1 + r * (CARD_H + CARD_GAP)
+        cx = 2 + c * (CARD_W + CARD_GAP)
+        if cx + CARD_W > w - 1 or cy + CARD_H > top + grid_h - 1:
+            break
+        _draw_card(stdscr, s, cy, cx, idx == cursor)
+
+    # paging hint when there's overflow
+    total_pages = (len(sessions) + page_size - 1) // page_size
+    if total_pages > 1:
+        page_num = (cursor // page_size) + 1
+        hint = f" page {page_num}/{total_pages} — {len(sessions)} sessions "
+        safe_addstr(stdscr, top + grid_h - 1, max(2, w - len(hint) - 2),
+                    hint, curses.color_pair(C_DIM))
+
+
 def render_detail(stdscr, sessions: list[Session], cursor: int, detail_y: int, detail_h: int):
     if detail_h <= 4 or not sessions:
         return
@@ -832,9 +1035,10 @@ def render_detail(stdscr, sessions: list[Session], cursor: int, detail_y: int, d
         safe_addstr(stdscr, detail_y + 1 + i, 14, str(v))
 
 
-def render_keybar(stdscr, message: str):
+def render_keybar(stdscr, message: str, mode: str = "cards"):
     h, w = stdscr.getmaxyx()
-    keys = " [j/k]move [f]ocus [enter]detail [o]pen [c]opy [K]ill [r]efresh [q]uit "
+    move = "[h/j/k/l]" if mode == "cards" else "[j/k]"
+    keys = f" {move}move [f]ocus [enter]detail [o]pen [c]opy [K]ill [r]efresh [q]uit "
     safe_addstr(stdscr, h - 1, 0, keys.ljust(w - 1)[: w - 1],
                 curses.color_pair(C_BORDER) | curses.A_REVERSE)
     if message:
@@ -842,15 +1046,19 @@ def render_keybar(stdscr, message: str):
                     curses.color_pair(C_HEADER) | curses.A_BOLD)
 
 
-def render(stdscr, sessions: list[Session], cursor: int, last_refresh: float, message: str):
+def render(stdscr, sessions: list[Session], cursor: int, last_refresh: float,
+           message: str, mode: str = "cards"):
     stdscr.erase()
     h, _ = stdscr.getmaxyx()
     top = 3
     table_h = max(8, h - top - 8)
     render_header(stdscr, sessions, last_refresh)
-    render_table(stdscr, sessions, cursor, top, table_h)
+    if mode == "cards":
+        render_grid(stdscr, sessions, cursor, top, table_h)
+    else:
+        render_table(stdscr, sessions, cursor, top, table_h)
     render_detail(stdscr, sessions, cursor, top + table_h, h - (top + table_h) - 2)
-    render_keybar(stdscr, message)
+    render_keybar(stdscr, message, mode)
     stdscr.refresh()
 
 
@@ -993,7 +1201,7 @@ def focus_terminal_for_tty(tty_path: str) -> tuple[bool, str]:
     return False, err or "tab not found"
 
 
-def main(stdscr):
+def main(stdscr, mode: str = "cards"):
     curses.curs_set(0)
     init_colors()
     stdscr.nodelay(True)
@@ -1020,7 +1228,7 @@ def main(stdscr):
             refresh()
         if message and time.time() > message_until:
             message = ""
-        render(stdscr, sessions, cursor, last_refresh, message)
+        render(stdscr, sessions, cursor, last_refresh, message, mode)
 
         try:
             ch = stdscr.getch()
@@ -1032,10 +1240,26 @@ def main(stdscr):
             break
         elif ch in (ord("j"), curses.KEY_DOWN):
             if sessions:
-                cursor = (cursor + 1) % len(sessions)
+                if mode == "cards":
+                    cols = grid_cols(stdscr.getmaxyx()[1])
+                    nxt = cursor + cols
+                    cursor = nxt if nxt < len(sessions) else cursor
+                else:
+                    cursor = (cursor + 1) % len(sessions)
         elif ch in (ord("k"), curses.KEY_UP):
             if sessions:
+                if mode == "cards":
+                    cols = grid_cols(stdscr.getmaxyx()[1])
+                    prv = cursor - cols
+                    cursor = prv if prv >= 0 else cursor
+                else:
+                    cursor = (cursor - 1) % len(sessions)
+        elif ch in (ord("h"), curses.KEY_LEFT):
+            if sessions and mode == "cards":
                 cursor = (cursor - 1) % len(sessions)
+        elif ch in (ord("l"), curses.KEY_RIGHT):
+            if sessions and mode == "cards":
+                cursor = (cursor + 1) % len(sessions)
         elif ch == ord("g"):
             cursor = 0
         elif ch == ord("G"):
@@ -1094,6 +1318,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--hook", action="store_true",
                    help="(internal) hook callback — reads JSON payload from stdin "
                         "and appends to ~/.claude/mission-control/<session>.state.jsonl")
+    p.add_argument("--rows", action="store_true",
+                   help="use the classic single-row-per-session table layout "
+                        "instead of the default card grid")
     return p
 
 
@@ -1107,6 +1334,6 @@ if __name__ == "__main__":
         sys.exit(cmd_teardown())
     maybe_prompt_first_run()
     try:
-        curses.wrapper(main)
+        curses.wrapper(main, "rows" if args.rows else "cards")
     except KeyboardInterrupt:
         pass
