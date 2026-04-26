@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import hashlib
 import json
 import os
 import subprocess
@@ -105,6 +106,9 @@ class Session:
     tokens_in: int = 0
     tokens_out: int = 0
     cache_read: int = 0
+    # most recent assistant turn's prompt size (input + cache_read) — i.e. the
+    # current conversation context size, used to render "% of context"
+    last_context_tokens: int = 0
     pid: Optional[int] = None
     last_user_msg: str = ""
     last_assistant_msg: str = ""
@@ -498,6 +502,7 @@ def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, in
     cwd = ""
     model = "?"
     tokens_in = tokens_out = cache_read = 0
+    last_context_tokens = 0
     last_user = last_asst = last_tool = ""
     pending_tool_uses: dict[str, str] = {}  # id → name
 
@@ -512,6 +517,10 @@ def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, in
             cache_read += usage.get("cache_read_input_tokens", 0) or 0
             if msg.get("model"):
                 model = msg["model"]
+            # current context = input + cache_read of most recent assistant turn
+            if e.get("type") == "assistant" and usage:
+                last_context_tokens = (usage.get("input_tokens", 0) or 0) \
+                    + (usage.get("cache_read_input_tokens", 0) or 0)
         # extract content
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, str):
@@ -580,6 +589,7 @@ def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, in
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         cache_read=cache_read,
+        last_context_tokens=last_context_tokens,
         pid=pid,
         last_user_msg=last_user,
         last_assistant_msg=last_asst,
@@ -676,17 +686,29 @@ C_TITLE = 9
 def init_colors():
     curses.start_color()
     curses.use_default_colors()
+    has_256 = curses.COLORS >= 256
+
     curses.init_pair(C_BORDER,  curses.COLOR_GREEN,   -1)
     curses.init_pair(C_HEADER,  curses.COLOR_YELLOW,  -1)
     curses.init_pair(C_WORKING, curses.COLOR_CYAN,    -1)
     curses.init_pair(C_WAITING, curses.COLOR_YELLOW,  -1)
     curses.init_pair(C_IDLE,    curses.COLOR_WHITE,   -1)
     curses.init_pair(C_STUCK,   curses.COLOR_RED,     -1)
-    curses.init_pair(C_CURSOR,  curses.COLOR_BLACK,   curses.COLOR_GREEN)
-    # bright-black (8) only exists on 256-color terminals; fall back to default
-    dim_fg = 8 if curses.COLORS >= 16 else -1
-    curses.init_pair(C_DIM,     dim_fg,               -1)
-    curses.init_pair(C_TITLE,   curses.COLOR_MAGENTA, -1)
+
+    # cursor: bright white on a muted slate-blue. softer than the previous
+    # black-on-bright-green, which felt aggressive — but still unmistakable
+    # as a "selected" highlight. falls back to plain white-on-blue.
+    cursor_fg = 15 if has_256 else curses.COLOR_WHITE
+    cursor_bg = 24 if has_256 else curses.COLOR_BLUE
+    curses.init_pair(C_CURSOR, cursor_fg, cursor_bg)
+
+    # dim: light gray (color 250) on 256-color terminals — noticeably more
+    # legible than the old "bright black" (8) which renders almost invisible
+    # on dark themes. falls back to bright black on 16-color, default on basic.
+    dim_fg = 250 if has_256 else (8 if curses.COLORS >= 16 else -1)
+    curses.init_pair(C_DIM, dim_fg, -1)
+
+    curses.init_pair(C_TITLE, curses.COLOR_MAGENTA, -1)
 
 
 def fmt_idle(sec: float) -> str:
@@ -809,6 +831,300 @@ def render_table(stdscr, sessions: list[Session], cursor: int, top: int, table_h
                     curses.color_pair(C_DIM))
 
 
+# grid layout: cards laid out left-to-right, top-to-bottom inside the box
+CARD_W   = 32
+CARD_H   = 11
+CARD_GAP = 1
+# default Claude context window in tokens; "1m" in the model id bumps it to 1M
+CONTEXT_WINDOW_DEFAULT = 200_000
+
+
+def grid_cols(screen_w: int) -> int:
+    """How many cards fit across the screen at this width."""
+    avail = max(0, screen_w - 4)  # 1-col margin inside each box border
+    return max(1, (avail + CARD_GAP) // (CARD_W + CARD_GAP))
+
+
+def _centered(text: str, width: int) -> str:
+    text = text[:width]
+    pad = (width - len(text)) // 2
+    return (" " * pad + text).ljust(width)
+
+
+def _centered_at(text: str, anchor: int, width: int) -> str:
+    """Place `text` so its center sits at column `anchor` within `width`."""
+    text = text[:width]
+    start = max(0, min(anchor - len(text) // 2, width - len(text)))
+    return (" " * start + text).ljust(width)
+
+
+# mascot animations — each frame is a tuple of 4 strings, each MASCOT_W chars wide.
+# row 0 is the "above-head" floating area (used by sleeping; empty otherwise).
+MASCOT_W = 13
+
+MASCOTS = {
+    "sleeping": [
+        ("        z    ",
+         "▄█████▄ Z    ",
+         "█─░░░─█      ",
+         "▀█████▀      "),
+        ("        Z    ",
+         "▄█████▄ z    ",
+         "█─░░░─█      ",
+         "▀█████▀      "),
+    ],
+    "working": [
+        # 8-frame braille spinner with the eyes blinking once per cycle.
+        # the spinner is the unambiguous "I'm working" signal; the blink
+        # adds life so the mascot doesn't read as frozen.
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠋   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠙   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠹   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█-░░░-█  ⠸   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠼   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠴   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█  ⠦   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█-░░░-█  ⠧   ",
+         "▀█████▀      "),
+    ],
+    "notifying": [
+        ("             ",
+         "▄█████▄  !   ",
+         "█◉░░░◉█      ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█●░░░●█      ",
+         "▀█████▀      "),
+    ],
+    "waiting": [
+        ("             ",
+         "▄█████▄      ",
+         "█·░░░·█  .   ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█·░░░·█ . .  ",
+         "▀█████▀      "),
+        ("             ",
+         "▄█████▄      ",
+         "█·░░░·█. . . ",
+         "▀█████▀      "),
+    ],
+}
+
+# (animation key, frames-per-second). different speeds give each state its own "feel".
+_MASCOT_FOR_STATUS = {
+    Status.WORKING: ("working",   5.0),
+    Status.WAITING: ("notifying", 2.0),
+    Status.STUCK:   ("notifying", 3.0),
+    Status.IDLE:    ("waiting",   1.5),
+    Status.ZOMBIE:  ("sleeping",  1.0),
+    Status.ENDED:   ("sleeping",  0.5),
+}
+
+
+def _mascot_frame(status: Status) -> tuple[str, ...]:
+    key, speed = _MASCOT_FOR_STATUS.get(status, ("sleeping", 0.5))
+    frames = MASCOTS[key]
+    return frames[int(time.time() * speed) % len(frames)]
+
+
+# Mascot name pool — ~280 short, multicultural first names so the grid feels
+# diverse even with many sessions. all <= 10 chars to keep card row 1 clean
+# (mascot starts at inner col 8; longer names overlap the mascot's blank
+# header row, harmlessly except for sleeping where the floating Z lives at
+# inner col 16 — well past the cap).
+MASCOT_NAMES = (
+    "Aarav", "Adam", "Adaeze", "Adel", "Adwoa", "Ahmed", "Aiyana", "Akamu",
+    "Akemi", "Aki", "Akin", "Alex", "Alenka", "Alia", "Alice", "Amara",
+    "Aminata", "Amir", "Anastasia", "Anaya", "Anders", "Andrej", "Anja",
+    "Anna", "Antonio", "Aoi", "Aolani", "Arjun", "Asha", "Astrid", "Atohi",
+    "Aurora", "Avi", "Ayaan", "Aysel", "Bahar", "Bao", "Bashir", "Beatrice",
+    "Ben", "Bjorn", "Bola", "Boris", "Burak", "Camille", "Carlos", "Catori",
+    "Caterina", "Charlotte", "Chen", "Cheyenne", "Chidi", "Citlali", "Clara",
+    "Claude", "Daichi", "Dai", "Daniela", "Darius", "David", "Dele", "Devi",
+    "Diana", "Diego", "Diya", "Dmitri", "Dragana", "Dusan", "Ebele", "Ebru",
+    "Eiko", "Eitan", "Ekaterina", "Eleanor", "Elena", "Eli", "Elif", "Emma",
+    "Erik", "Ernesto", "Esha", "Esperanza", "Esra", "Eva", "Farah", "Fatima",
+    "Federico", "Felix", "Femi", "Filip", "Francesca", "Freya", "Frieda",
+    "Fumi", "Gabriel", "Galina", "Gianna", "Greta", "Hadi", "Hana", "Hannah",
+    "Haru", "Hassan", "Hayato", "Helena", "Henrik", "Hilde", "Hina", "Hiro",
+    "Hiroshi", "Hossein", "Hugo", "Ichika", "Igor", "Ilya", "Imani", "Indra",
+    "Ines", "Inga", "Ingrid", "Irena", "Isabella", "Ishaan", "Itzel", "Ivan",
+    "Jakob", "Jana", "Jasper", "Jin", "Jiro", "Joaquin", "Julia", "Jumoke",
+    "Jun", "Kabir", "Kai", "Kaito", "Kala", "Kalei", "Kamau", "Kapua",
+    "Karim", "Karl", "Katja", "Kavya", "Keiko", "Kenji", "Kira", "Kiyoshi",
+    "Klaus", "Kofi", "Kohei", "Kojo", "Krishna", "Kunal", "Kweku", "Lakshmi",
+    "Lani", "Lars", "Layla", "Lei", "Leila", "Leilani", "Lena", "Lerato",
+    "Lev", "Lidia", "Liora", "Liv", "Lucas", "Lucia", "Magda", "Magnus",
+    "Mahea", "Mahpee", "Makoa", "Manu", "Manuel", "Marco", "Marek", "Martina",
+    "Maryam", "Mateo", "Matilde", "Maya", "Meera", "Mehmet", "Mei", "Miguel",
+    "Mika", "Mikkel", "Mila", "Min", "Minato", "Mira", "Misha", "Moana",
+    "Mohan", "Nadav", "Nadia", "Nahuel", "Naledi", "Nalu", "Naomi", "Naoko",
+    "Natalia", "Nayeli", "Niels", "Nikhil", "Nikolai", "Nils", "Nisha",
+    "Nizhoni", "Nneka", "Noa", "Nori", "Nour", "Obi", "Odin", "Olav",
+    "Olga", "Olu", "Omar", "Otto", "Pablo", "Paula", "Pavel", "Pedro",
+    "Petra", "Pierre", "Pooja", "Priya", "Pua", "Quetzal", "Rafael", "Rahul",
+    "Raj", "Ren", "Renata", "Reza", "Riko", "Rin", "Riya", "Roni", "Rosa",
+    "Rumi", "Ryu", "Sade", "Saeed", "Sai", "Saki", "Salim", "Salvador",
+    "Samira", "Sanjay", "Santiago", "Sara", "Sasha", "Satoshi", "Sebastian",
+    "Selma", "Sergio", "Shanti", "Shira", "Sho", "Sigrid", "Slava", "Sofia",
+    "Sofiya", "Sora", "Stefan", "Sun", "Sung", "Sven", "Taeko", "Tahki",
+    "Takeshi", "Tal", "Tamara", "Tane", "Tao", "Tara", "Tariq", "Tariro",
+    "Themba", "Thora", "Tiare", "Tomas", "Tomo", "Tunde", "Tuva", "Uliana",
+    "Ulf", "Valentina", "Vasil", "Vera", "Vidya", "Vikram", "Vincent",
+    "Wangari", "Wei", "Xia", "Xochitl", "Yaa", "Yael", "Yara", "Yasmin",
+    "Yelena", "Yossi", "Yuki", "Yuma", "Yuna", "Yuto", "Zara", "Zeynep",
+    "Zofia", "Zola", "Zuri",
+)
+
+
+def mascot_name(session_id: str) -> str:
+    """Deterministic mascot name from a session_id — same name every render
+    for the same session, no state file needed."""
+    if not session_id or session_id == "(no transcript)":
+        return ""
+    h = int(hashlib.md5(session_id.encode()).hexdigest(), 16)
+    return MASCOT_NAMES[h % len(MASCOT_NAMES)]
+
+
+def _draw_card(stdscr, s: Session, y: int, x: int, is_cursor: bool):
+    inner_w = CARD_W - 2
+    # cursor highlight wins over status color; otherwise the border itself
+    # carries the status color so e.g. a red STUCK card jumps out across the
+    # grid. blink on a border is visual chaos — strip it.
+    if is_cursor:
+        border_attr = curses.color_pair(C_CURSOR) | curses.A_BOLD
+    else:
+        border_attr = status_color(s.status) & ~curses.A_BLINK
+
+    safe_addstr(stdscr, y, x, "+" + "-" * (CARD_W - 2) + "+", border_attr)
+    safe_addstr(stdscr, y + CARD_H - 1, x, "+" + "-" * (CARD_W - 2) + "+", border_attr)
+    for i in range(1, CARD_H - 1):
+        safe_addstr(stdscr, y + i, x, "|", border_attr)
+        safe_addstr(stdscr, y + i, x + CARD_W - 1, "|", border_attr)
+
+    # title overlaid on top border: "[ ◆ project[:branch] ]"
+    title_room = inner_w - 4  # for "[ " and " ]"
+    branch_part = f":{s.branch}" if s.branch and s.branch not in ("—", "?") else ""
+    title_inner = f" {s.status.glyph} {s.project_name}{branch_part} "[:title_room]
+    title_attr = (curses.color_pair(C_CURSOR) | curses.A_BOLD) if is_cursor \
+                 else (curses.color_pair(C_TITLE) | curses.A_BOLD)
+    safe_addstr(stdscr, y, x + 2, f"[{title_inner}]", title_attr)
+
+    # content layout (CARD_H=11 → 9 content lines):
+    #   rows 1-4  mascot (centered; row 1 carries the floating Z for sleeping)
+    #   row 5     status verb   ← centered under mascot face (the headline)
+    #   row 6     empty         ← breathing room beneath the verb
+    #   row 7     status detail ← centered, dim
+    #   row 8     tokens · % of context (centered, dim)
+    #   row 9     last user prompt, prefixed "> " (dim, truncated with …)
+    frame = _mascot_frame(s.status)
+    # mascot tinted with status color, but no bold/blink — keep it ambient
+    mascot_attr = status_color(s.status) & ~curses.A_BLINK & ~curses.A_BOLD
+    mascot_x = x + 1 + (inner_w - MASCOT_W) // 2
+    for i, line in enumerate(frame):
+        safe_addstr(stdscr, y + 1 + i, mascot_x, line, mascot_attr)
+
+    # mascot name, left-aligned on row 1 (overlays the mascot's blank header
+    # row). capped at 12 chars so it never crashes into the sleeping Z, which
+    # floats far right at inner col 16.
+    name = mascot_name(s.session_id)
+    if name:
+        safe_addstr(stdscr, y + 1, x + 1, name[:12], curses.color_pair(C_DIM))
+
+    # center status under the mascot's face (the 7-col body), not the full
+    # 13-col mascot+accessory block. otherwise the verb appears pulled right
+    # of the eyes because the accessory padding shifts the block's midpoint.
+    MASCOT_FACE_W = 7
+    face_center = (inner_w - MASCOT_W) // 2 + MASCOT_FACE_W // 2
+    verb = s.status.value.upper()
+    detail = s.status_detail
+    safe_addstr(stdscr, y + 5, x + 1, _centered_at(verb, face_center, inner_w),
+                status_color(s.status))
+    safe_addstr(stdscr, y + 7, x + 1, _centered_at(detail, face_center, inner_w),
+                curses.color_pair(C_DIM))
+
+    ctx_window = 1_000_000 if "1m" in (s.model or "").lower() else CONTEXT_WINDOW_DEFAULT
+    ctx_pct = int(round(s.last_context_tokens / ctx_window * 100)) \
+              if s.last_context_tokens else 0
+    line_meta = f"{fmt_tokens(s.tokens_total)} tok · {ctx_pct}% ctx"[:inner_w]
+
+    last_cmd = (s.last_user_msg or "").strip().replace("\n", " ")
+    prefix = "> "
+    budget = inner_w - len(prefix)
+    if not last_cmd:
+        line_cmd = f"{prefix}(no input yet)"
+    elif len(last_cmd) > budget:
+        line_cmd = f"{prefix}{last_cmd[:budget - 1]}…"
+    else:
+        line_cmd = f"{prefix}{last_cmd}"
+    line_cmd = line_cmd[:inner_w]
+
+    safe_addstr(stdscr, y + 8, x + 1, _centered_at(line_meta, face_center, inner_w),
+                curses.color_pair(C_DIM))
+    safe_addstr(stdscr, y + 9, x + 1, line_cmd.ljust(inner_w),
+                curses.color_pair(C_DIM))
+
+
+def render_grid(stdscr, sessions: list[Session], cursor: int, top: int, grid_h: int):
+    h, w = stdscr.getmaxyx()
+    draw_box(stdscr, top, 0, grid_h, w, "live sessions")
+
+    if not sessions:
+        safe_addstr(stdscr, top + 2, 4,
+                    "no live claude sessions found in the last 30 minutes",
+                    curses.color_pair(C_DIM))
+        return
+
+    avail_h = grid_h - 2
+    cols = grid_cols(w)
+    rows = max(1, (avail_h + CARD_GAP) // (CARD_H + CARD_GAP))
+    page_size = cols * rows
+    page_start = (cursor // page_size) * page_size
+
+    for i, s in enumerate(sessions[page_start:page_start + page_size]):
+        idx = page_start + i
+        c, r = i % cols, i // cols
+        cy = top + 1 + r * (CARD_H + CARD_GAP)
+        cx = 2 + c * (CARD_W + CARD_GAP)
+        if cx + CARD_W > w - 1 or cy + CARD_H > top + grid_h - 1:
+            break
+        _draw_card(stdscr, s, cy, cx, idx == cursor)
+
+    # paging hint when there's overflow
+    total_pages = (len(sessions) + page_size - 1) // page_size
+    if total_pages > 1:
+        page_num = (cursor // page_size) + 1
+        hint = f" page {page_num}/{total_pages} — {len(sessions)} sessions "
+        safe_addstr(stdscr, top + grid_h - 1, max(2, w - len(hint) - 2),
+                    hint, curses.color_pair(C_DIM))
+
+
 def render_detail(stdscr, sessions: list[Session], cursor: int, detail_y: int, detail_h: int):
     if detail_h <= 4 or not sessions:
         return
@@ -819,6 +1135,10 @@ def render_detail(stdscr, sessions: list[Session], cursor: int, detail_y: int, d
     info_lines = [
         ("cwd",        s.cwd),
         ("session",    s.session_id),
+        ("branch",     s.branch),
+        ("idle",       fmt_idle(s.idle_sec)),
+        ("model",      s.model),
+        ("pid",        str(s.pid) if s.pid else "—"),
         ("last user",  s.last_user_msg.replace("\n", " ⏎ ")),
         ("last asst",  s.last_assistant_msg.replace("\n", " ⏎ ")),
         ("last tool",  s.last_tool or "—"),
@@ -832,9 +1152,10 @@ def render_detail(stdscr, sessions: list[Session], cursor: int, detail_y: int, d
         safe_addstr(stdscr, detail_y + 1 + i, 14, str(v))
 
 
-def render_keybar(stdscr, message: str):
+def render_keybar(stdscr, message: str, mode: str = "cards"):
     h, w = stdscr.getmaxyx()
-    keys = " [j/k]move [f]ocus [enter]detail [o]pen [c]opy [K]ill [r]efresh [q]uit "
+    move = "[h/j/k/l]" if mode == "cards" else "[j/k]"
+    keys = f" {move}move [f]ocus [enter]detail [o]pen [c]opy [K]ill [r]efresh [q]uit "
     safe_addstr(stdscr, h - 1, 0, keys.ljust(w - 1)[: w - 1],
                 curses.color_pair(C_BORDER) | curses.A_REVERSE)
     if message:
@@ -842,15 +1163,19 @@ def render_keybar(stdscr, message: str):
                     curses.color_pair(C_HEADER) | curses.A_BOLD)
 
 
-def render(stdscr, sessions: list[Session], cursor: int, last_refresh: float, message: str):
+def render(stdscr, sessions: list[Session], cursor: int, last_refresh: float,
+           message: str, mode: str = "cards"):
     stdscr.erase()
     h, _ = stdscr.getmaxyx()
     top = 3
     table_h = max(8, h - top - 8)
     render_header(stdscr, sessions, last_refresh)
-    render_table(stdscr, sessions, cursor, top, table_h)
+    if mode == "cards":
+        render_grid(stdscr, sessions, cursor, top, table_h)
+    else:
+        render_table(stdscr, sessions, cursor, top, table_h)
     render_detail(stdscr, sessions, cursor, top + table_h, h - (top + table_h) - 2)
-    render_keybar(stdscr, message)
+    render_keybar(stdscr, message, mode)
     stdscr.refresh()
 
 
@@ -993,7 +1318,7 @@ def focus_terminal_for_tty(tty_path: str) -> tuple[bool, str]:
     return False, err or "tab not found"
 
 
-def main(stdscr):
+def main(stdscr, mode: str = "cards"):
     curses.curs_set(0)
     init_colors()
     stdscr.nodelay(True)
@@ -1020,7 +1345,7 @@ def main(stdscr):
             refresh()
         if message and time.time() > message_until:
             message = ""
-        render(stdscr, sessions, cursor, last_refresh, message)
+        render(stdscr, sessions, cursor, last_refresh, message, mode)
 
         try:
             ch = stdscr.getch()
@@ -1032,10 +1357,26 @@ def main(stdscr):
             break
         elif ch in (ord("j"), curses.KEY_DOWN):
             if sessions:
-                cursor = (cursor + 1) % len(sessions)
+                if mode == "cards":
+                    cols = grid_cols(stdscr.getmaxyx()[1])
+                    nxt = cursor + cols
+                    cursor = nxt if nxt < len(sessions) else cursor
+                else:
+                    cursor = (cursor + 1) % len(sessions)
         elif ch in (ord("k"), curses.KEY_UP):
             if sessions:
+                if mode == "cards":
+                    cols = grid_cols(stdscr.getmaxyx()[1])
+                    prv = cursor - cols
+                    cursor = prv if prv >= 0 else cursor
+                else:
+                    cursor = (cursor - 1) % len(sessions)
+        elif ch in (ord("h"), curses.KEY_LEFT):
+            if sessions and mode == "cards":
                 cursor = (cursor - 1) % len(sessions)
+        elif ch in (ord("l"), curses.KEY_RIGHT):
+            if sessions and mode == "cards":
+                cursor = (cursor + 1) % len(sessions)
         elif ch == ord("g"):
             cursor = 0
         elif ch == ord("G"):
@@ -1094,6 +1435,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--hook", action="store_true",
                    help="(internal) hook callback — reads JSON payload from stdin "
                         "and appends to ~/.claude/mission-control/<session>.state.jsonl")
+    p.add_argument("--rows", action="store_true",
+                   help="use the classic single-row-per-session table layout "
+                        "instead of the default card grid")
     return p
 
 
@@ -1107,6 +1451,6 @@ if __name__ == "__main__":
         sys.exit(cmd_teardown())
     maybe_prompt_first_run()
     try:
-        curses.wrapper(main)
+        curses.wrapper(main, "rows" if args.rows else "cards")
     except KeyboardInterrupt:
         pass
