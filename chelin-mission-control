@@ -1132,13 +1132,15 @@ def render_detail(stdscr, sessions: list[Session], cursor: int, detail_y: int, d
     s = sessions[cursor] if cursor < len(sessions) else sessions[0]
     draw_box(stdscr, detail_y, 0, detail_h, w,
              f"detail :: {s.session_id[:8]}")
+    # branch/idle/model/pid all collapse into one row to save space — the
+    # detail pane is height-limited and dropping them off the bottom would
+    # be a worse outcome than fitting them on one line.
+    meta = (f"branch: {s.branch}  ·  idle: {fmt_idle(s.idle_sec)}"
+            f"  ·  model: {s.model}  ·  pid: {s.pid or '—'}")
     info_lines = [
         ("cwd",        s.cwd),
         ("session",    s.session_id),
-        ("branch",     s.branch),
-        ("idle",       fmt_idle(s.idle_sec)),
-        ("model",      s.model),
-        ("pid",        str(s.pid) if s.pid else "—"),
+        ("meta",       meta),
         ("last user",  s.last_user_msg.replace("\n", " ⏎ ")),
         ("last asst",  s.last_assistant_msg.replace("\n", " ⏎ ")),
         ("last tool",  s.last_tool or "—"),
@@ -1168,7 +1170,10 @@ def render(stdscr, sessions: list[Session], cursor: int, last_refresh: float,
     stdscr.erase()
     h, _ = stdscr.getmaxyx()
     top = 3
-    table_h = max(8, h - top - 8)
+    # reserve 10 rows below the table/grid for the detail pane + keybar (was
+    # 8). bumped because the detail pane gained more fields and was clipping
+    # `last user` / `last asst` on typical 40-row terminals.
+    table_h = max(8, h - top - 10)
     render_header(stdscr, sessions, last_refresh)
     if mode == "cards":
         render_grid(stdscr, sessions, cursor, top, table_h)
