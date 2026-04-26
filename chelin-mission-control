@@ -811,7 +811,7 @@ def render_table(stdscr, sessions: list[Session], cursor: int, top: int, table_h
 
 # grid layout: cards laid out left-to-right, top-to-bottom inside the box
 CARD_W   = 32
-CARD_H   = 9
+CARD_H   = 11
 CARD_GAP = 1
 
 
@@ -819,6 +819,19 @@ def grid_cols(screen_w: int) -> int:
     """How many cards fit across the screen at this width."""
     avail = max(0, screen_w - 4)  # 1-col margin inside each box border
     return max(1, (avail + CARD_GAP) // (CARD_W + CARD_GAP))
+
+
+def _centered(text: str, width: int) -> str:
+    text = text[:width]
+    pad = (width - len(text)) // 2
+    return (" " * pad + text).ljust(width)
+
+
+def _centered_at(text: str, anchor: int, width: int) -> str:
+    """Place `text` so its center sits at column `anchor` within `width`."""
+    text = text[:width]
+    start = max(0, min(anchor - len(text) // 2, width - len(text)))
+    return (" " * start + text).ljust(width)
 
 
 # mascot animations — each frame is a tuple of 4 strings, each MASCOT_W chars wide.
@@ -939,27 +952,31 @@ def _draw_card(stdscr, s: Session, y: int, x: int, is_cursor: bool):
                  else (curses.color_pair(C_TITLE) | curses.A_BOLD)
     safe_addstr(stdscr, y, x + 2, f"[{title_inner}]", title_attr)
 
-    # content layout (CARD_H=9 → 7 content lines):
-    #   row 1  mascot row 0 (floating Z for sleeping, else empty)
-    #   row 2  mascot row 1 (head top)         | status verb   ← right of mascot
-    #   row 3  mascot row 2 (eyes/scanner)     | status detail
-    #   row 4  mascot row 3 (head bottom)
-    #   row 5  branch (left) + idle (right)    ← full width below mascot
-    #   row 6  tokens · model (dim)
-    #   row 7  pid (dim)
+    # content layout (CARD_H=11 → 9 content lines):
+    #   rows 1-4  mascot (centered horizontally; row 1 carries the floating Z
+    #             for sleeping and is empty otherwise)
+    #   row 5     status verb   ← centered, bold, status-colored (the headline)
+    #   row 6     status detail ← centered, dim
+    #   row 7     branch (left) + idle (right)
+    #   row 8     tokens · model (dim)
+    #   row 9     pid (dim)
     frame = _mascot_frame(s.status)
     # mascot tinted with status color, but no bold/blink — keep it ambient
     mascot_attr = status_color(s.status) & ~curses.A_BLINK & ~curses.A_BOLD
+    mascot_x = x + 1 + (inner_w - MASCOT_W) // 2
     for i, line in enumerate(frame):
-        safe_addstr(stdscr, y + 1 + i, x + 1, line, mascot_attr)
+        safe_addstr(stdscr, y + 1 + i, mascot_x, line, mascot_attr)
 
-    status_x = x + 1 + MASCOT_W + 1  # 1 col gap between mascot and status text
-    status_w = max(1, inner_w - MASCOT_W - 1)
-    verb = s.status.value.upper()[:status_w]
-    detail = s.status_detail[:status_w]
-    safe_addstr(stdscr, y + 2, status_x, verb.ljust(status_w),
+    # center status under the mascot's face (the 7-col body), not the full
+    # 13-col mascot+accessory block. otherwise the verb appears pulled right
+    # of the eyes because the accessory padding shifts the block's midpoint.
+    MASCOT_FACE_W = 7
+    face_center = (inner_w - MASCOT_W) // 2 + MASCOT_FACE_W // 2
+    verb = s.status.value.upper()
+    detail = s.status_detail
+    safe_addstr(stdscr, y + 5, x + 1, _centered_at(verb, face_center, inner_w),
                 status_color(s.status))
-    safe_addstr(stdscr, y + 3, status_x, detail.ljust(status_w),
+    safe_addstr(stdscr, y + 6, x + 1, _centered_at(detail, face_center, inner_w),
                 curses.color_pair(C_DIM))
 
     idle_str = f"idle {fmt_idle(s.idle_sec)}"
@@ -971,10 +988,10 @@ def _draw_card(stdscr, s: Session, y: int, x: int, is_cursor: bool):
     line_pid = (f"pid {s.pid}" if s.pid else "pid —")[:inner_w]
     branch_dim = curses.color_pair(C_DIM) if s.branch in ("—", "?") else 0
 
-    safe_addstr(stdscr, y + 5, x + 1, line_branch.ljust(inner_w), branch_dim)
-    safe_addstr(stdscr, y + 6, x + 1, line_meta.ljust(inner_w),
+    safe_addstr(stdscr, y + 7, x + 1, line_branch.ljust(inner_w), branch_dim)
+    safe_addstr(stdscr, y + 8, x + 1, line_meta.ljust(inner_w),
                 curses.color_pair(C_DIM))
-    safe_addstr(stdscr, y + 7, x + 1, line_pid.ljust(inner_w),
+    safe_addstr(stdscr, y + 9, x + 1, line_pid.ljust(inner_w),
                 curses.color_pair(C_DIM))
 
 
