@@ -65,10 +65,6 @@ class Status(str, Enum):
     def glyph(self) -> str:
         return _STATUS_GLYPH[self]
 
-    @property
-    def sort_rank(self) -> int:
-        return _STATUS_RANK[self]
-
 
 _STATUS_GLYPH = {
     Status.WORKING: "◆",
@@ -77,15 +73,6 @@ _STATUS_GLYPH = {
     Status.STUCK:   "✗",
     Status.ENDED:   "†",
     Status.ZOMBIE:  "Z",
-}
-
-_STATUS_RANK = {
-    Status.WAITING: 0,
-    Status.STUCK:   1,
-    Status.WORKING: 2,
-    Status.IDLE:    3,
-    Status.ZOMBIE:  4,
-    Status.ENDED:   5,
 }
 
 
@@ -98,10 +85,15 @@ class Session:
     session_id: str
     jsonl_path: Path
     cwd: str
+    project_name: str = ""
     branch: str = "?"
     status: Status = Status.IDLE
     status_detail: str = ""
     last_activity: float = 0.0
+    # transcript / process creation time, used as a stable sort key so rows
+    # don't reorder across refreshes (mtime would, since it ticks on every
+    # transcript write).
+    created_at: float = 0.0
     model: str = "?"
     tokens_in: int = 0
     tokens_out: int = 0
@@ -114,10 +106,6 @@ class Session:
     last_assistant_msg: str = ""
     last_tool: str = ""
     tail_entries: list[dict] = field(default_factory=list)
-
-    @property
-    def project_name(self) -> str:
-        return Path(self.cwd).name or self.cwd
 
     @property
     def idle_sec(self) -> float:
@@ -199,17 +187,29 @@ def status_from_events(events: list[dict]) -> tuple[Optional[Status], str, str]:
     """
     if not events:
         return None, "", ""
-    pending_tools: dict[str, str] = {}  # tool_use_id → tool_name
+    # tool_use_id → (tool_name, PreToolUse ts) — track ts so we can later
+    # discard orphan entries (PreToolUse with no matching PostToolUse from
+    # tools that crashed or were interrupted long ago).
+    pending_tools: dict[str, tuple[str, float]] = {}
     pending_permission_tool: Optional[str] = None
+    # `stopped` tracks whether the assistant explicitly handed control back.
+    # Set on Stop / StopFailure; cleared on UserPromptSubmit / PreToolUse
+    # (the user re-engaged or the assistant is using a tool again). This
+    # lets us still report WAITING for a session whose last event is some
+    # tail noise (e.g. an info-only Notification) but whose most recent
+    # state-changing event was Stop.
+    stopped: Optional[tuple[Status, str]] = None
     last_tool = ""
     for e in events:
         ev = e.get("event")
         tu = e.get("tool_use_id")
         name = e.get("tool_name")
+        ts = e.get("ts") or 0.0
         if name:
             last_tool = name
         if ev == "PreToolUse" and tu:
-            pending_tools[tu] = name or "?"
+            pending_tools[tu] = (name or "?", ts)
+            stopped = None
         elif ev in ("PostToolUse", "PostToolUseFailure") and tu:
             pending_tools.pop(tu, None)
             # answering a permission prompt clears it
@@ -218,23 +218,52 @@ def status_from_events(events: list[dict]) -> tuple[Optional[Status], str, str]:
             pending_permission_tool = name or last_tool or "?"
         elif ev == "Notification" and e.get("matcher") == "permission_prompt":
             pending_permission_tool = name or last_tool or "?"
+        elif ev == "UserPromptSubmit":
+            stopped = None
         elif ev == "Stop":
             pending_permission_tool = None
+            stopped = (Status.WAITING, "needs input")
+        elif ev == "StopFailure":
+            reason = e.get("matcher") or e.get("reason") or "?"
+            stopped = (Status.STUCK, str(reason))
         elif ev == "SessionEnd":
             return Status.ENDED, "", last_tool
 
     last = events[-1]
     last_ev = last.get("event")
-    if pending_permission_tool:
+    last_ts = last.get("ts") or 0
+    # The "in-flight" signals (pending_tools, pending_permission_tool, last
+    # event ∈ {UserPromptSubmit, PostToolUse, SubagentStart/Stop, …}) are only
+    # meaningful while the session is actually firing hooks. Healthy sessions
+    # fire something every few seconds during real work; quiescent state is
+    # >60s with nothing new. After that:
+    #   - pending_tools entries are orphans (PreToolUse with no PostToolUse
+    #     match — tools that crashed, were interrupted, or whose follow-up
+    #     hooks never fired). They aren't actually running.
+    #   - The last in-flight event is stale; the assistant has moved on
+    #     without firing Stop (typical for sessions whose hooks were
+    #     installed mid-life and partially registered).
+    # Either way, return None so summarize_session falls back to the JSONL
+    # heuristic, which can read `stop_reason` authoritatively.
+    # Stop / StopFailure / SessionStart remain authoritative regardless of
+    # age — they're terminal signals about what state the session ended in.
+    STALE_INFLIGHT_SEC = 60
+    quiescent = bool(last_ts and time.time() - last_ts > STALE_INFLIGHT_SEC)
+    # Drop orphan PreToolUses (no PostToolUse match within the freshness
+    # window). These accumulate over a session's lifetime when tools crash
+    # or are interrupted; without this filter, a single ancient Bash that
+    # never returned would mark the session WORKING forever.
+    now = time.time()
+    fresh_pending = [name for (name, ts) in pending_tools.values()
+                     if ts and now - ts < STALE_INFLIGHT_SEC]
+    if pending_permission_tool and not quiescent:
         return Status.STUCK, f"awaiting permission ({pending_permission_tool})", last_tool
-    if pending_tools:
-        running = next(iter(pending_tools.values()))
-        return Status.WORKING, f"tool: {running}", last_tool
-    if last_ev == "Stop":
-        return Status.WAITING, "needs input", last_tool
-    if last_ev == "StopFailure":
-        reason = last.get("matcher") or last.get("reason") or "?"
-        return Status.STUCK, str(reason), last_tool
+    if fresh_pending and not quiescent:
+        return Status.WORKING, f"tool: {fresh_pending[0]}", last_tool
+    if stopped is not None:
+        return stopped[0], stopped[1], last_tool
+    if quiescent:
+        return None, "", last_tool
     if last_ev == "UserPromptSubmit":
         return Status.WORKING, "thinking", last_tool
     if last_ev in ("PostToolUse", "PostToolUseFailure", "SubagentStart", "SubagentStop"):
@@ -449,18 +478,58 @@ def live_claude_pids() -> dict[str, int]:
     return out
 
 
-def git_branch(cwd: str) -> str:
+def git_info(cwd: str) -> tuple[str, str]:
+    """Return (project_name, branch) for a given cwd.
+
+    project_name is the name of the *main* repo, even when cwd is a git
+    worktree. We get there via `--git-common-dir`, which points back to the
+    canonical .git directory of the host repo regardless of the worktree's
+    on-disk location (so it works for any worktree layout, not just the
+    .claude/worktrees/<name> shape we use here). branch is whatever HEAD points
+    at right now in this worktree. Falls back to the cwd basename and "—" when
+    git is unavailable or cwd isn't inside a repo.
+    """
+    fallback_name = Path(cwd).name or cwd
     try:
-        r = subprocess.run(
+        r1 = subprocess.run(
+            ["git", "-C", cwd, "rev-parse",
+             "--show-toplevel", "--git-common-dir"],
+            capture_output=True, text=True, timeout=1
+        )
+        if r1.returncode != 0:
+            return fallback_name, "—"
+        lines = r1.stdout.strip().splitlines()
+        if len(lines) < 2:
+            return fallback_name, "—"
+        common = Path(lines[1])
+        if not common.is_absolute():
+            # in the main repo, --git-common-dir prints `.git` relative to cwd
+            common = (Path(cwd) / common).resolve()
+        # parent of `.git` is the host repo root; this is the worktree fix —
+        # `--show-toplevel` would give us the worktree dir, not the main repo.
+        project_root = common.parent if common.name == ".git" else common
+        project_name = project_root.name or fallback_name
+
+        r2 = subprocess.run(
             ["git", "-C", cwd, "branch", "--show-current"],
             capture_output=True, text=True, timeout=1
         )
-        if r.returncode == 0:
-            b = r.stdout.strip()
-            return b or "(detached)"
+        branch = (r2.stdout.strip() if r2.returncode == 0 else "") or "(detached)"
+        return project_name, branch
     except Exception:
-        pass
-    return "—"
+        return fallback_name, "—"
+
+
+def _parse_iso(ts: Optional[str]) -> float:
+    """Parse a JSONL entry timestamp ('2026-04-28T15:54:17.031Z') to epoch.
+    Returns 0.0 if missing or unparseable."""
+    if not ts:
+        return 0.0
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
 
 
 def parse_jsonl_tail(path: Path, n: int = 60) -> list[dict]:
@@ -505,6 +574,12 @@ def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, in
     last_context_tokens = 0
     last_user = last_asst = last_tool = ""
     pending_tool_uses: dict[str, str] = {}  # id → name
+    # last assistant entry's stop_reason is our authoritative signal when the
+    # state file isn't trustworthy. "end_turn" = assistant explicitly handed
+    # control back, so the session is at the prompt — that's IDLE, regardless
+    # of what mtime might suggest.
+    last_asst_stop_reason: Optional[str] = None
+    last_asst_ts: float = 0.0
 
     for e in entries:
         if "cwd" in e and not cwd:
@@ -521,6 +596,9 @@ def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, in
             if e.get("type") == "assistant" and usage:
                 last_context_tokens = (usage.get("input_tokens", 0) or 0) \
                     + (usage.get("cache_read_input_tokens", 0) or 0)
+            if e.get("type") == "assistant" and "stop_reason" in msg:
+                last_asst_stop_reason = msg.get("stop_reason")
+                last_asst_ts = _parse_iso(e.get("timestamp")) or last_asst_ts
         # extract content
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, str):
@@ -552,9 +630,23 @@ def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, in
     age = time.time() - st.st_mtime
     pid = live_pids.get(cwd)
 
-    state_status, state_detail, state_tool = status_from_events(read_state_events(path.stem))
+    state_events = read_state_events(path.stem)
+    state_status, state_detail, state_tool = status_from_events(state_events)
     if state_tool:
         last_tool = state_tool
+
+    # partial-hooks fix: a session that was already running when --setup ran
+    # may fire some hooks (UserPromptSubmit, PostToolUse, SubagentStop…) but
+    # never Stop. status_from_events would then return WORKING off the most
+    # recent in-flight event, hiding the fact that the assistant has *already*
+    # written `stop_reason="end_turn"` to the JSONL since. Whichever signal is
+    # newer wins; the JSONL is authoritative when it is.
+    last_state_ts = state_events[-1].get("ts", 0.0) if state_events else 0.0
+    if (state_status == Status.WORKING
+            and last_asst_stop_reason == "end_turn"
+            and last_asst_ts > last_state_ts
+            and not pending_tool_uses):
+        state_status, state_detail = None, ""
 
     if state_status is not None and (force_live or pid is not None):
         status, detail = state_status, state_detail
@@ -563,28 +655,40 @@ def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, in
     elif state_status is not None:  # state file says ENDED even without live pid
         status, detail = state_status, state_detail
     else:
-        # fallback: legacy JSONL heuristic
-        last_type = entries[-1].get("type")
-        if pending_tool_uses:
-            if age > 15:
-                status, detail = Status.STUCK, f"awaiting permission ({last_tool})"
-            else:
-                status, detail = Status.WORKING, f"tool: {last_tool}"
-        elif age > 5 and last_type == "assistant":
-            status, detail = Status.WAITING, "needs input"
-        elif age > 5:
-            status, detail = Status.WAITING, f"idle {fmt_idle(age)}"
-        else:
+        # fallback: live session, but no state file (or all events stale).
+        # Claude Code reads settings.json once at session start, so any
+        # session that was already running before --setup will never fire our
+        # hooks for its lifetime — there's no reload mechanism (verified via
+        # claude-code#5513 / #15858). The JSONL transcript is enough: each
+        # assistant entry carries `message.stop_reason` ("end_turn",
+        # "tool_use", "max_tokens"), which tells us authoritatively what
+        # state the session is in without needing hooks.
+        if pending_tool_uses and age > 15:
+            status, detail = Status.STUCK, f"awaiting permission ({last_tool})"
+        elif pending_tool_uses:
+            status, detail = Status.WORKING, f"tool: {last_tool}"
+        elif last_asst_stop_reason == "end_turn":
+            # assistant explicitly finished its turn — at prompt, no hooks
+            status, detail = Status.IDLE, "no hooks"
+        elif last_asst_stop_reason == "max_tokens":
+            status, detail = Status.STUCK, "max tokens"
+        elif last_asst_stop_reason in ("tool_use", None) and age < 2:
+            # transcript is currently being written: streaming or just-emitted
             status, detail = Status.WORKING, "thinking"
+        else:
+            status, detail = Status.IDLE, "no hooks"
 
+    project_name, branch = git_info(cwd)
     return Session(
         session_id=path.stem,
         jsonl_path=path,
         cwd=cwd,
-        branch=git_branch(cwd),
+        project_name=project_name,
+        branch=branch,
         status=status,
         status_detail=detail,
         last_activity=st.st_mtime,
+        created_at=getattr(st, "st_birthtime", st.st_ctime),
         model=model,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
@@ -641,14 +745,17 @@ def discover_sessions() -> list[Session]:
             started = time.mktime(time.strptime(etime, "%a %b %d %H:%M:%S %Y"))
         except Exception:
             started = time.time()
+        proj_name, branch = git_info(cwd)
         sessions.append(Session(
             session_id="(no transcript)",
             jsonl_path=Path("/dev/null"),
             cwd=cwd,
-            branch=git_branch(cwd),
+            project_name=proj_name,
+            branch=branch,
             status=Status.ZOMBIE,
             status_detail="no transcript file",
             last_activity=started,
+            created_at=started,
             pid=pid,
         ))
 
@@ -663,7 +770,10 @@ def discover_sessions() -> list[Session]:
             if s:
                 sessions.append(s)
 
-    sessions.sort(key=lambda s: (s.status.sort_rank, -s.last_activity))
+    # stable, creation-time sort: oldest at top, newest at bottom. Each row
+    # keeps its slot across refreshes regardless of status churn or which
+    # session ticked the transcript most recently.
+    sessions.sort(key=lambda s: s.created_at)
     return sessions
 
 
@@ -804,7 +914,7 @@ def render_table(stdscr, sessions: list[Session], cursor: int, top: int, table_h
             safe_addstr(stdscr, row_y, 1, " " * (w - 2),
                         curses.color_pair(C_CURSOR))
         cells = [
-            (chr(ord('a') + idx) if idx < 26 else str(idx), 0),
+            (str(idx + 1), 0),
             (s.status.glyph, status_color(s.status)),
             (s.project_name[:21], 0),
             (s.branch[:17], curses.color_pair(C_DIM) if s.branch in ("—", "?") else 0),
