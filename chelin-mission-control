@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import curses
-import hashlib
 import json
 import os
 import subprocess
@@ -703,8 +702,10 @@ def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, in
 
 
 def encode_cwd(cwd: str) -> str:
-    """Inverse of decode_project_dir — replace `/` with `-`."""
-    return cwd.replace("/", "-")
+    """Mirror Claude Code's project-dir naming: replace `/` and `.` with `-`.
+    Without the `.` mapping, paths under hidden dirs (e.g. `.claude/worktrees/`)
+    miss their project dir and surface as duplicate ZOMBIE rows."""
+    return cwd.replace("/", "-").replace(".", "-")
 
 
 def newest_jsonl(proj_dir: Path) -> Optional[Path]:
@@ -770,11 +771,45 @@ def discover_sessions() -> list[Session]:
             if s:
                 sessions.append(s)
 
-    # stable, creation-time sort: oldest at top, newest at bottom. Each row
-    # keeps its slot across refreshes regardless of status churn or which
-    # session ticked the transcript most recently.
-    sessions.sort(key=lambda s: s.created_at)
+    # caller (main) applies the active sort mode; we don't sort here so that
+    # changing sort doesn't require re-discovering.
     return sessions
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sorting
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Default ("status") groups live sessions first, zombies second-to-last, ended
+# last — so dead rows don't push interesting ones off-screen. Within each group
+# rows fall back to creation time so the ordering is stable across refreshes.
+# Other modes are user-pickable via the `s` key in the TUI.
+
+SORT_MODES = ("status", "idle", "tokens", "name", "created", "manual")
+_STATUS_GROUP = {Status.ENDED: 2, Status.ZOMBIE: 1}
+
+
+def sort_sessions(sessions: list[Session], mode: str,
+                  manual_order: list[str] | None = None) -> None:
+    """Sort sessions in place by the named mode.
+
+    "manual" honors `manual_order` (a list of session_ids); sessions absent
+    from it fall in by created_at after the named ones.
+    """
+    if mode == "idle":
+        sessions.sort(key=lambda s: -s.idle_sec)
+    elif mode == "tokens":
+        sessions.sort(key=lambda s: -s.tokens_total)
+    elif mode == "name":
+        sessions.sort(key=lambda s: (s.project_name.lower(), s.created_at))
+    elif mode == "created":
+        sessions.sort(key=lambda s: s.created_at)
+    elif mode == "manual":
+        order = {sid: i for i, sid in enumerate(manual_order or [])}
+        sentinel = len(order)
+        sessions.sort(key=lambda s: (order.get(s.session_id, sentinel), s.created_at))
+    else:  # "status" (default)
+        sessions.sort(key=lambda s: (_STATUS_GROUP.get(s.status, 0), s.created_at))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -884,13 +919,15 @@ TABLE_COLS = [
 ]
 
 
-def render_header(stdscr, sessions: list[Session], last_refresh: float):
+def render_header(stdscr, sessions: list[Session], last_refresh: float,
+                  sort_mode: str = "status"):
     _, w = stdscr.getmaxyx()
     title = "*** CLAUDE MISSION CONTROL ***"
     safe_addstr(stdscr, 0, max(0, (w - len(title)) // 2), title,
                 curses.color_pair(C_TITLE) | curses.A_BOLD)
     age = time.time() - last_refresh
-    sub = f"sessions: {len(sessions)}    refresh: {age:.1f}s ago    {time.strftime('%H:%M:%S')}"
+    sub = (f"sessions: {len(sessions)}    refresh: {age:.1f}s ago"
+           f"    sort: {sort_mode}    {time.strftime('%H:%M:%S')}")
     safe_addstr(stdscr, 1, max(0, (w - len(sub)) // 2), sub, curses.color_pair(C_DIM))
 
 
@@ -943,7 +980,7 @@ def render_table(stdscr, sessions: list[Session], cursor: int, top: int, table_h
 
 # grid layout: cards laid out left-to-right, top-to-bottom inside the box
 CARD_W   = 32
-CARD_H   = 11
+CARD_H   = 12
 CARD_GAP = 1
 # default Claude context window in tokens; "1m" in the model id bumps it to 1M
 CONTEXT_WINDOW_DEFAULT = 200_000
@@ -1063,66 +1100,8 @@ def _mascot_frame(status: Status) -> tuple[str, ...]:
     return frames[int(time.time() * speed) % len(frames)]
 
 
-# Mascot name pool — ~280 short, multicultural first names so the grid feels
-# diverse even with many sessions. all <= 10 chars to keep card row 1 clean
-# (mascot starts at inner col 8; longer names overlap the mascot's blank
-# header row, harmlessly except for sleeping where the floating Z lives at
-# inner col 16 — well past the cap).
-MASCOT_NAMES = (
-    "Aarav", "Adam", "Adaeze", "Adel", "Adwoa", "Ahmed", "Aiyana", "Akamu",
-    "Akemi", "Aki", "Akin", "Alex", "Alenka", "Alia", "Alice", "Amara",
-    "Aminata", "Amir", "Anastasia", "Anaya", "Anders", "Andrej", "Anja",
-    "Anna", "Antonio", "Aoi", "Aolani", "Arjun", "Asha", "Astrid", "Atohi",
-    "Aurora", "Avi", "Ayaan", "Aysel", "Bahar", "Bao", "Bashir", "Beatrice",
-    "Ben", "Bjorn", "Bola", "Boris", "Burak", "Camille", "Carlos", "Catori",
-    "Caterina", "Charlotte", "Chen", "Cheyenne", "Chidi", "Citlali", "Clara",
-    "Claude", "Daichi", "Dai", "Daniela", "Darius", "David", "Dele", "Devi",
-    "Diana", "Diego", "Diya", "Dmitri", "Dragana", "Dusan", "Ebele", "Ebru",
-    "Eiko", "Eitan", "Ekaterina", "Eleanor", "Elena", "Eli", "Elif", "Emma",
-    "Erik", "Ernesto", "Esha", "Esperanza", "Esra", "Eva", "Farah", "Fatima",
-    "Federico", "Felix", "Femi", "Filip", "Francesca", "Freya", "Frieda",
-    "Fumi", "Gabriel", "Galina", "Gianna", "Greta", "Hadi", "Hana", "Hannah",
-    "Haru", "Hassan", "Hayato", "Helena", "Henrik", "Hilde", "Hina", "Hiro",
-    "Hiroshi", "Hossein", "Hugo", "Ichika", "Igor", "Ilya", "Imani", "Indra",
-    "Ines", "Inga", "Ingrid", "Irena", "Isabella", "Ishaan", "Itzel", "Ivan",
-    "Jakob", "Jana", "Jasper", "Jin", "Jiro", "Joaquin", "Julia", "Jumoke",
-    "Jun", "Kabir", "Kai", "Kaito", "Kala", "Kalei", "Kamau", "Kapua",
-    "Karim", "Karl", "Katja", "Kavya", "Keiko", "Kenji", "Kira", "Kiyoshi",
-    "Klaus", "Kofi", "Kohei", "Kojo", "Krishna", "Kunal", "Kweku", "Lakshmi",
-    "Lani", "Lars", "Layla", "Lei", "Leila", "Leilani", "Lena", "Lerato",
-    "Lev", "Lidia", "Liora", "Liv", "Lucas", "Lucia", "Magda", "Magnus",
-    "Mahea", "Mahpee", "Makoa", "Manu", "Manuel", "Marco", "Marek", "Martina",
-    "Maryam", "Mateo", "Matilde", "Maya", "Meera", "Mehmet", "Mei", "Miguel",
-    "Mika", "Mikkel", "Mila", "Min", "Minato", "Mira", "Misha", "Moana",
-    "Mohan", "Nadav", "Nadia", "Nahuel", "Naledi", "Nalu", "Naomi", "Naoko",
-    "Natalia", "Nayeli", "Niels", "Nikhil", "Nikolai", "Nils", "Nisha",
-    "Nizhoni", "Nneka", "Noa", "Nori", "Nour", "Obi", "Odin", "Olav",
-    "Olga", "Olu", "Omar", "Otto", "Pablo", "Paula", "Pavel", "Pedro",
-    "Petra", "Pierre", "Pooja", "Priya", "Pua", "Quetzal", "Rafael", "Rahul",
-    "Raj", "Ren", "Renata", "Reza", "Riko", "Rin", "Riya", "Roni", "Rosa",
-    "Rumi", "Ryu", "Sade", "Saeed", "Sai", "Saki", "Salim", "Salvador",
-    "Samira", "Sanjay", "Santiago", "Sara", "Sasha", "Satoshi", "Sebastian",
-    "Selma", "Sergio", "Shanti", "Shira", "Sho", "Sigrid", "Slava", "Sofia",
-    "Sofiya", "Sora", "Stefan", "Sun", "Sung", "Sven", "Taeko", "Tahki",
-    "Takeshi", "Tal", "Tamara", "Tane", "Tao", "Tara", "Tariq", "Tariro",
-    "Themba", "Thora", "Tiare", "Tomas", "Tomo", "Tunde", "Tuva", "Uliana",
-    "Ulf", "Valentina", "Vasil", "Vera", "Vidya", "Vikram", "Vincent",
-    "Wangari", "Wei", "Xia", "Xochitl", "Yaa", "Yael", "Yara", "Yasmin",
-    "Yelena", "Yossi", "Yuki", "Yuma", "Yuna", "Yuto", "Zara", "Zeynep",
-    "Zofia", "Zola", "Zuri",
-)
-
-
-def mascot_name(session_id: str) -> str:
-    """Deterministic mascot name from a session_id — same name every render
-    for the same session, no state file needed."""
-    if not session_id or session_id == "(no transcript)":
-        return ""
-    h = int(hashlib.md5(session_id.encode()).hexdigest(), 16)
-    return MASCOT_NAMES[h % len(MASCOT_NAMES)]
-
-
-def _draw_card(stdscr, s: Session, y: int, x: int, is_cursor: bool):
+def _draw_card(stdscr, s: Session, y: int, x: int, is_cursor: bool,
+               is_marked: bool = False):
     inner_w = CARD_W - 2
     # cursor highlight wins over status color; otherwise the border itself
     # carries the status color so e.g. a red STUCK card jumps out across the
@@ -1138,34 +1117,36 @@ def _draw_card(stdscr, s: Session, y: int, x: int, is_cursor: bool):
         safe_addstr(stdscr, y + i, x, "|", border_attr)
         safe_addstr(stdscr, y + i, x + CARD_W - 1, "|", border_attr)
 
-    # title overlaid on top border: "[ ◆ project[:branch] ]"
+    # title overlaid on top border: "[ ◆ project ]" — marked cards get a
+    # leading "*" so the user can see what they picked while moving the cursor.
     title_room = inner_w - 4  # for "[ " and " ]"
-    branch_part = f":{s.branch}" if s.branch and s.branch not in ("—", "?") else ""
-    title_inner = f" {s.status.glyph} {s.project_name}{branch_part} "[:title_room]
+    mark = "*" if is_marked else ""
+    title_inner = f" {mark}{s.status.glyph} {s.project_name} "[:title_room]
     title_attr = (curses.color_pair(C_CURSOR) | curses.A_BOLD) if is_cursor \
                  else (curses.color_pair(C_TITLE) | curses.A_BOLD)
     safe_addstr(stdscr, y, x + 2, f"[{title_inner}]", title_attr)
 
-    # content layout (CARD_H=11 → 9 content lines):
-    #   rows 1-4  mascot (centered; row 1 carries the floating Z for sleeping)
-    #   row 5     status verb   ← centered under mascot face (the headline)
-    #   row 6     empty         ← breathing room beneath the verb
-    #   row 7     status detail ← centered, dim
-    #   row 8     tokens · % of context (centered, dim)
-    #   row 9     last user prompt, prefixed "> " (dim, truncated with …)
+    # content layout (CARD_H=12 → 10 content lines):
+    #   row 1     branch (centered, dim) — its own line so we don't fight the
+    #             sleeping mascot's floating Z (which sits at mascot row 0)
+    #   rows 2-5  mascot (centered; row 2 carries the floating Z for sleeping)
+    #   row 6     status verb   ← centered under mascot face (the headline)
+    #   row 7     empty         ← breathing room beneath the verb
+    #   row 8     status detail ← centered, dim
+    #   row 9     tokens · % of context (centered, dim)
+    #   row 10    last user prompt, prefixed "> " (dim, truncated with …)
+    branch = s.branch if s.branch and s.branch not in ("—", "?") else ""
+    if branch:
+        safe_addstr(stdscr, y + 1, x + 1,
+                    _centered(branch, inner_w),
+                    curses.color_pair(C_DIM))
+
     frame = _mascot_frame(s.status)
     # mascot tinted with status color, but no bold/blink — keep it ambient
     mascot_attr = status_color(s.status) & ~curses.A_BLINK & ~curses.A_BOLD
     mascot_x = x + 1 + (inner_w - MASCOT_W) // 2
     for i, line in enumerate(frame):
-        safe_addstr(stdscr, y + 1 + i, mascot_x, line, mascot_attr)
-
-    # mascot name, left-aligned on row 1 (overlays the mascot's blank header
-    # row). capped at 12 chars so it never crashes into the sleeping Z, which
-    # floats far right at inner col 16.
-    name = mascot_name(s.session_id)
-    if name:
-        safe_addstr(stdscr, y + 1, x + 1, name[:12], curses.color_pair(C_DIM))
+        safe_addstr(stdscr, y + 2 + i, mascot_x, line, mascot_attr)
 
     # center status under the mascot's face (the 7-col body), not the full
     # 13-col mascot+accessory block. otherwise the verb appears pulled right
@@ -1174,9 +1155,9 @@ def _draw_card(stdscr, s: Session, y: int, x: int, is_cursor: bool):
     face_center = (inner_w - MASCOT_W) // 2 + MASCOT_FACE_W // 2
     verb = s.status.value.upper()
     detail = s.status_detail
-    safe_addstr(stdscr, y + 5, x + 1, _centered_at(verb, face_center, inner_w),
+    safe_addstr(stdscr, y + 6, x + 1, _centered_at(verb, face_center, inner_w),
                 status_color(s.status))
-    safe_addstr(stdscr, y + 7, x + 1, _centered_at(detail, face_center, inner_w),
+    safe_addstr(stdscr, y + 8, x + 1, _centered_at(detail, face_center, inner_w),
                 curses.color_pair(C_DIM))
 
     ctx_window = 1_000_000 if "1m" in (s.model or "").lower() else CONTEXT_WINDOW_DEFAULT
@@ -1195,13 +1176,14 @@ def _draw_card(stdscr, s: Session, y: int, x: int, is_cursor: bool):
         line_cmd = f"{prefix}{last_cmd}"
     line_cmd = line_cmd[:inner_w]
 
-    safe_addstr(stdscr, y + 8, x + 1, _centered_at(line_meta, face_center, inner_w),
+    safe_addstr(stdscr, y + 9, x + 1, _centered_at(line_meta, face_center, inner_w),
                 curses.color_pair(C_DIM))
-    safe_addstr(stdscr, y + 9, x + 1, line_cmd.ljust(inner_w),
+    safe_addstr(stdscr, y + 10, x + 1, line_cmd.ljust(inner_w),
                 curses.color_pair(C_DIM))
 
 
-def render_grid(stdscr, sessions: list[Session], cursor: int, top: int, grid_h: int):
+def render_grid(stdscr, sessions: list[Session], cursor: int, top: int, grid_h: int,
+                marked_id: Optional[str] = None):
     h, w = stdscr.getmaxyx()
     draw_box(stdscr, top, 0, grid_h, w, "live sessions")
 
@@ -1224,7 +1206,8 @@ def render_grid(stdscr, sessions: list[Session], cursor: int, top: int, grid_h: 
         cx = 2 + c * (CARD_W + CARD_GAP)
         if cx + CARD_W > w - 1 or cy + CARD_H > top + grid_h - 1:
             break
-        _draw_card(stdscr, s, cy, cx, idx == cursor)
+        _draw_card(stdscr, s, cy, cx, idx == cursor,
+                   is_marked=(marked_id is not None and s.session_id == marked_id))
 
     # paging hint when there's overflow
     total_pages = (len(sessions) + page_size - 1) // page_size
@@ -1267,7 +1250,8 @@ def render_detail(stdscr, sessions: list[Session], cursor: int, detail_y: int, d
 def render_keybar(stdscr, message: str, mode: str = "cards"):
     h, w = stdscr.getmaxyx()
     move = "[h/j/k/l]" if mode == "cards" else "[j/k]"
-    keys = f" {move}move [f]ocus [enter]detail [o]pen [c]opy [K]ill [r]efresh [q]uit "
+    keys = (f" {move}move [s]ort [m]swap [enter/f]ocus [d]etail "
+            f"[o]pen [c]opy [K]ill [r]efresh [q]uit ")
     safe_addstr(stdscr, h - 1, 0, keys.ljust(w - 1)[: w - 1],
                 curses.color_pair(C_BORDER) | curses.A_REVERSE)
     if message:
@@ -1276,7 +1260,8 @@ def render_keybar(stdscr, message: str, mode: str = "cards"):
 
 
 def render(stdscr, sessions: list[Session], cursor: int, last_refresh: float,
-           message: str, mode: str = "cards"):
+           message: str, mode: str = "cards", sort_mode: str = "status",
+           marked_id: Optional[str] = None):
     stdscr.erase()
     h, _ = stdscr.getmaxyx()
     top = 3
@@ -1284,9 +1269,9 @@ def render(stdscr, sessions: list[Session], cursor: int, last_refresh: float,
     # 8). bumped because the detail pane gained more fields and was clipping
     # `last user` / `last asst` on typical 40-row terminals.
     table_h = max(8, h - top - 10)
-    render_header(stdscr, sessions, last_refresh)
+    render_header(stdscr, sessions, last_refresh, sort_mode)
     if mode == "cards":
-        render_grid(stdscr, sessions, cursor, top, table_h)
+        render_grid(stdscr, sessions, cursor, top, table_h, marked_id)
     else:
         render_table(stdscr, sessions, cursor, top, table_h)
     render_detail(stdscr, sessions, cursor, top + table_h, h - (top + table_h) - 2)
@@ -1445,13 +1430,30 @@ def main(stdscr, mode: str = "cards"):
     last_refresh = 0.0
     message = ""
     message_until = 0.0
+    sort_mode = "status"
+    # `manual_order` records the user's hand-arranged order (session_ids).
+    # Survives mode switches so cycling away and back to "manual" restores it.
+    # `marked_id` is the session selected with the first `m` press, awaiting
+    # the second `m` press to swap with the cursor's current session.
+    manual_order: list[str] = []
+    marked_id: Optional[str] = None
 
     def refresh():
         nonlocal sessions, last_refresh, cursor
         sessions = discover_sessions()
+        sort_sessions(sessions, sort_mode, manual_order)
         last_refresh = time.time()
         if cursor >= len(sessions):
             cursor = max(0, len(sessions) - 1)
+
+    def do_focus(s: Session) -> str:
+        if not s.pid:
+            return "no live pid"
+        tty = tty_for_pid(s.pid)
+        if not tty:
+            return "no tty for pid"
+        ok, msg = focus_terminal_for_tty(tty)
+        return msg
 
     refresh()
 
@@ -1460,13 +1462,19 @@ def main(stdscr, mode: str = "cards"):
             refresh()
         if message and time.time() > message_until:
             message = ""
-        render(stdscr, sessions, cursor, last_refresh, message, mode)
+        render(stdscr, sessions, cursor, last_refresh, message, mode, sort_mode,
+               marked_id)
 
         try:
             ch = stdscr.getch()
         except KeyboardInterrupt:
             break
         if ch == -1:
+            continue
+        if ch == 27 and marked_id is not None:  # Esc cancels a pending swap
+            marked_id = None
+            message = "swap cancelled"
+            message_until = time.time() + 1.5
             continue
         if ch in (ord("q"), 27):
             break
@@ -1500,7 +1508,42 @@ def main(stdscr, mode: str = "cards"):
             refresh()
             message = "refreshed"
             message_until = time.time() + 1.5
-        elif ch in (curses.KEY_ENTER, 10, 13):
+        elif ch == ord("s"):
+            sort_mode = SORT_MODES[(SORT_MODES.index(sort_mode) + 1) % len(SORT_MODES)]
+            sort_sessions(sessions, sort_mode, manual_order)
+            message = f"sort: {sort_mode}"
+            message_until = time.time() + 1.5
+        elif ch == ord("m"):
+            if not sessions:
+                continue
+            current_id = sessions[cursor].session_id
+            if marked_id is None:
+                marked_id = current_id
+                message = f"marked: {sessions[cursor].project_name[:18]}"
+                message_until = time.time() + 5.0
+            elif marked_id == current_id:
+                marked_id = None
+                message = "unmarked"
+                message_until = time.time() + 1.5
+            else:
+                # Entering manual mode (if not already): seed manual_order from
+                # the current display order so the swap stays put across the
+                # next refresh.
+                if sort_mode != "manual":
+                    manual_order = [s.session_id for s in sessions]
+                    sort_mode = "manual"
+                # Append any unknown ids so .index() can't miss.
+                for sid in (marked_id, current_id):
+                    if sid not in manual_order:
+                        manual_order.append(sid)
+                ia = manual_order.index(marked_id)
+                ib = manual_order.index(current_id)
+                manual_order[ia], manual_order[ib] = manual_order[ib], manual_order[ia]
+                sort_sessions(sessions, sort_mode, manual_order)
+                marked_id = None
+                message = "swapped"
+                message_until = time.time() + 1.5
+        elif ch == ord("d"):
             if sessions:
                 show_detail_modal(stdscr, sessions[cursor])
         elif ch == ord("o"):
@@ -1521,18 +1564,9 @@ def main(stdscr, mode: str = "cards"):
                 except Exception as e:
                     message = f"kill failed: {e}"
                 message_until = time.time() + 2.0
-        elif ch == ord("f"):
+        elif ch == ord("f") or ch in (curses.KEY_ENTER, 10, 13):
             if sessions:
-                s = sessions[cursor]
-                if not s.pid:
-                    message = "no live pid"
-                else:
-                    tty = tty_for_pid(s.pid)
-                    if not tty:
-                        message = "no tty for pid"
-                    else:
-                        ok, msg = focus_terminal_for_tty(tty)
-                        message = msg
+                message = do_focus(sessions[cursor])
                 message_until = time.time() + 2.0
 
 
