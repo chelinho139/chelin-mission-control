@@ -703,8 +703,17 @@ def summarize_session(path: Path, project_dir_name: str, live_pids: dict[str, in
 
 
 def encode_cwd(cwd: str) -> str:
-    """Inverse of decode_project_dir — replace `/` with `-`."""
-    return cwd.replace("/", "-")
+    """Encode a cwd to its `~/.claude/projects/` directory name.
+
+    Claude Code's rule (per its `projectSlug`) is `[^a-zA-Z0-9] → -`, so
+    every non-alphanumeric char collapses to `-`. Slash-only replacement
+    breaks any cwd containing `.` (e.g. worktrees under `.claude/`):
+    `proj_dir.exists()` then returns False in `discover_sessions` step 1
+    and the live session is surfaced twice — once as ZOMBIE "no transcript
+    file" via the bare-process branch, and again as WORKING via step 2's
+    transcript walk (which re-derives the cwd from the JSONL contents).
+    """
+    return "".join(c if c.isascii() and c.isalnum() else "-" for c in cwd)
 
 
 def newest_jsonl(proj_dir: Path) -> Optional[Path]:
